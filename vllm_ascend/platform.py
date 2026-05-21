@@ -147,6 +147,13 @@ class NPUPlatform(Platform):
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
+            kv_action = parser._option_string_actions.get("--kv-cache-dtype")
+            if kv_action and hasattr(kv_action, "choices") and kv_action.choices:
+                for tq_dtype in ("turboquant_k8v4", "turboquant_4bit_nc",
+                                 "turboquant_k3v4_nc", "turboquant_3bit_nc"):
+                    if tq_dtype not in kv_action.choices:
+                        kv_action.choices.append(tq_dtype)
+
         if not is_310p():
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendModelSlimConfig  # noqa: F401
         else:

@@ -62,9 +62,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
-    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm_ascend.attention.tq_spec import TQFullAttentionSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,

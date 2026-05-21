@@ -21,7 +21,7 @@ import torch
 import torch_npu
 
 from vllm.config import get_current_vllm_config
-from vllm.config.cache import CacheDType
+from vllm_ascend.attention.tq_config import TurboQuantConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -62,7 +62,7 @@ class AscendTurboQuantBackend(AttentionBackend):
         torch.float16,
         torch.bfloat16,
     ]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+    supported_kv_cache_dtypes: ClassVar[list[str]] = [
         "turboquant_k8v4",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
@@ -105,15 +105,11 @@ class AscendTurboQuantBackend(AttentionBackend):
 
         Layout: (num_blocks, block_size, num_kv_heads, slot_size_aligned)
         """
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            TurboQuantConfig,
-        )
-
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
         return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
 
     @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None) -> bool:
         if kv_cache_dtype is None:
             return False
         return kv_cache_dtype.startswith("turboquant_")
@@ -206,10 +202,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            TurboQuantConfig,
-        )
 
         self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
         self._val_data_bytes = math.ceil(head_size * self.tq_config.effective_value_quant_bits / 8)

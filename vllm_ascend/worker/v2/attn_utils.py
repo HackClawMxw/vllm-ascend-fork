@@ -32,9 +32,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
-    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm_ascend.attention.tq_spec import TQFullAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder

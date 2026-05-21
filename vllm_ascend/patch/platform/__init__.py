@@ -18,6 +18,8 @@ import os
 
 import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_interface  # noqa
+import vllm_ascend.patch.platform.patch_cache_dtype  # noqa
+import vllm_ascend.patch.platform.patch_tq_attention  # noqa
 from vllm_ascend import envs
 from vllm_ascend.utils import is_310p
 

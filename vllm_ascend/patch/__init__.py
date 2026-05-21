@@ -263,6 +263,36 @@
 #       Remove this patch once the vLLM fix is included in the supported vLLM
 #       version.
 #
+# ** 11. File: platform/patch_cache_dtype.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.config.cache.CacheConfig.model_fields["cache_dtype"].annotation`
+#   2. `vllm.utils.torch_utils.STR_DTYPE_TO_TORCH_DTYPE`
+#    Why:
+#       The base vllm's CacheDType Literal does not include turboquant_* entries,
+#       so Pydantic validation rejects them at config construction.  Additionally,
+#       kv_cache_dtype_str_to_dtype() cannot resolve turboquant to torch.uint8.
+#    How:
+#       Widen the cache_dtype field annotation from CacheDType to str and rebuild
+#       the Pydantic model.  Register turboquant_* → torch.uint8 mappings in
+#       STR_DTYPE_TO_TORCH_DTYPE.
+#    Future Plan:
+#       Remove this patch once the base vllm includes turboquant in CacheDType.
+#
+# ** 12. File: platform/patch_tq_attention.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.layers.attention.attention.Attention.get_kv_cache_spec`
+#    Why:
+#       The base vllm's Attention layer has no turboquant branch in
+#       get_kv_cache_spec, so turboquant layers would get a regular
+#       FullAttentionSpec with wrong memory layout.
+#    How:
+#       Monkey-patch get_kv_cache_spec to return TQFullAttentionSpec when
+#       kv_cache_dtype starts with "turboquant_", using the local
+#       TurboQuantConfig and TQFullAttentionSpec from vllm_ascend.
+#    Future Plan:
+#       Remove this patch once the base vllm includes turboquant in
+#       Attention.get_kv_cache_spec.
+#
 # * Worker Patch:
 # ===============
 #
