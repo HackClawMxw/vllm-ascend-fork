@@ -1,0 +1,402 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""NPU (PyTorch) implementation of TurboQuant decode attention.
+
+Replaces the Triton decode kernels with pure PyTorch operations
+that run on Ascend NPU via torch_npu.
+
+Strategy for Phase 0: dequantize KV from TQ cache to FP16,
+then use npu_fused_infer_attention_score for standard attention.
+
+This is the simplest correct implementation. Performance optimization
+(fused bit-unpack + attention) can be added later as a C++ custom op.
+"""
+
+import math
+
+import torch
+import torch_npu
+
+
+def _unpack_mse_key(
+    slot_data: torch.Tensor,
+    centroids: torch.Tensor,
+    mse_bits: int,
+    mse_bytes: int,
+    head_dim: int,
+    norm_correction: bool = False,
+) -> torch.Tensor:
+    """Unpack MSE key indices and reconstruct key vector.
+
+    Args:
+        slot_data: (..., slot_size) uint8 slot data for one position/head.
+        centroids: (n_centroids,) float32 centroids.
+        mse_bits: 3 or 4 bits.
+        mse_bytes: bytes for packed MSE indices.
+        head_dim: attention head dimension.
+        norm_correction: whether to normalize centroid vectors.
+
+    Returns:
+        key: (..., head_dim) float16 reconstructed key.
+    """
+    n_centroids = 1 << mse_bits
+
+    # Unpack bit-packed indices
+    mse_raw = slot_data[..., :mse_bytes].to(torch.int32)
+
+    if mse_bits == 4:
+        # Two 4-bit indices per byte
+        idx_lo = mse_raw & 0xF
+        idx_hi = (mse_raw >> 4) & 0xF
+        indices = torch.stack([idx_lo, idx_hi], dim=-1).reshape(
+            *mse_raw.shape[:-1], head_dim
+        )
+    elif mse_bits == 3:
+        # Eight 3-bit indices per 3 bytes
+        n_groups = head_dim // 8
+        raw = slot_data[..., : n_groups * 3].to(torch.int32)
+        # Read 2 bytes per group for 16-bit window
+        raw_16 = torch.zeros(*raw.shape[:-1], n_groups, 4, dtype=torch.int32, device=raw.device)
+        for g in range(n_groups):
+            raw_16[..., g, 0] = raw[..., g * 3]
+            raw_16[..., g, 1] = raw[..., g * 3 + 1]
+            raw_16[..., g, 2] = raw[..., g * 3 + 2]
+
+        # For each of the 8 indices in a group
+        indices_list = []
+        for b in range(8):
+            byte_idx = (b * 3) // 8
+            bit_off = (b * 3) % 8
+            if bit_off <= 5:
+                idx = (raw_16[..., byte_idx] >> bit_off) & 0x7
+            else:
+                idx = ((raw_16[..., byte_idx] >> bit_off) |
+                       (raw_16[..., byte_idx + 1] << (8 - bit_off))) & 0x7
+            indices_list.append(idx)
+        indices = torch.stack(indices_list, dim=-1).reshape(
+            *slot_data.shape[:-1], head_dim
+        )
+    else:
+        raise ValueError(f"Unsupported mse_bits: {mse_bits}")
+
+    indices = indices.clamp(0, n_centroids - 1)
+
+    # Gather centroids
+    key = centroids[indices]
+
+    # Norm correction: re-normalize centroid vector to unit norm
+    if norm_correction:
+        c_norm_sq = (key * key).sum(dim=-1, keepdim=True)
+        c_inv_norm = 1.0 / torch.sqrt(c_norm_sq + 1e-16)
+        key = key * c_inv_norm
+
+    # Load and apply vec_norm (fp16 at MSE_BYTES offset, little-endian 2 bytes)
+    norm_lo = slot_data[..., mse_bytes].to(torch.uint16)
+    norm_hi = slot_data[..., mse_bytes + 1].to(torch.uint16)
+    vec_norm = ((norm_lo | (norm_hi << 8)).view(torch.float16)).to(torch.float32)
+    vec_norm = vec_norm.unsqueeze(-1)  # broadcast over head_dim
+
+    key = vec_norm * key
+
+    return key.to(torch.float16)
+
+
+def _unpack_fp8_key(
+    slot_data: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Unpack FP8 key from slot data.
+
+    Args:
+        slot_data: (..., slot_size) uint8 slot data.
+        head_dim: attention head dimension.
+
+    Returns:
+        key: (..., head_dim) float16 reconstructed key.
+    """
+    k_bytes = slot_data[..., :head_dim]
+    k_fp8 = k_bytes.view(torch.float8_e4m3fn)
+    return k_fp8.to(torch.float16)
+
+
+def _unpack_value(
+    slot_data: torch.Tensor,
+    key_packed_size: int,
+    value_quant_bits: int,
+    val_data_bytes: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Unpack quantized value from slot data.
+
+    Args:
+        slot_data: (..., slot_size) uint8 slot data.
+        key_packed_size: offset to value data.
+        value_quant_bits: 3 or 4 bits.
+        val_data_bytes: bytes for packed value data.
+        head_dim: attention head dimension.
+
+    Returns:
+        value: (..., head_dim) float16 reconstructed value.
+    """
+    val_raw = slot_data[..., key_packed_size : key_packed_size + val_data_bytes].to(
+        torch.int32
+    )
+
+    if value_quant_bits == 4:
+        idx_lo = val_raw & 0xF
+        idx_hi = (val_raw >> 4) & 0xF
+        v_indices = torch.stack([idx_lo, idx_hi], dim=-1).reshape(
+            *val_raw.shape[:-1], head_dim
+        )
+    elif value_quant_bits == 3:
+        n_groups = head_dim // 8
+        raw = slot_data[..., key_packed_size : key_packed_size + n_groups * 3].to(
+            torch.int32
+        )
+        raw_16 = torch.zeros(*raw.shape[:-1], n_groups, 4, dtype=torch.int32, device=raw.device)
+        for g in range(n_groups):
+            raw_16[..., g, 0] = raw[..., g * 3]
+            raw_16[..., g, 1] = raw[..., g * 3 + 1]
+            raw_16[..., g, 2] = raw[..., g * 3 + 2]
+
+        indices_list = []
+        for b in range(8):
+            byte_idx = (b * 3) // 8
+            bit_off = (b * 3) % 8
+            if bit_off <= 5:
+                idx = (raw_16[..., byte_idx] >> bit_off) & 0x7
+            else:
+                idx = ((raw_16[..., byte_idx] >> bit_off) |
+                       (raw_16[..., byte_idx + 1] << (8 - bit_off))) & 0x7
+            indices_list.append(idx)
+        v_indices = torch.stack(indices_list, dim=-1).reshape(
+            *slot_data.shape[:-1], head_dim
+        )
+    else:
+        raise ValueError(f"Unsupported value_quant_bits: {value_quant_bits}")
+
+    v_indices = v_indices.to(torch.float32)
+
+    # Load scale and zero (fp16, 4 bytes total at val_data_bytes offset)
+    sc_base = key_packed_size + val_data_bytes
+    sc_lo = slot_data[..., sc_base].to(torch.uint16)
+    sc_hi = slot_data[..., sc_base + 1].to(torch.uint16)
+    v_scale = ((sc_lo | (sc_hi << 8)).view(torch.float16)).to(torch.float32)
+
+    zr_lo = slot_data[..., sc_base + 2].to(torch.uint16)
+    zr_hi = slot_data[..., sc_base + 3].to(torch.uint16)
+    v_zero = ((zr_lo | (zr_hi << 8)).view(torch.float16)).to(torch.float32)
+
+    # Dequantize: value = index * scale + zero
+    value = v_indices * v_scale.unsqueeze(-1) + v_zero.unsqueeze(-1)
+    return value.to(torch.float16)
+
+
+def _gather_and_dequant_kv(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    num_kv_heads: int,
+    head_dim: int,
+    key_fp8: bool,
+    mse_bits: int,
+    mse_bytes: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    val_data_bytes: int,
+    centroids: torch.Tensor,
+    norm_correction: bool,
+    Pi: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged KV blocks and dequantize to FP16.
+
+    Args:
+        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8 TQ cache.
+        block_table: (B, max_num_blocks) int32.
+        seq_lens: list of sequence lengths.
+        num_kv_heads: number of KV heads.
+        head_dim: attention head dimension.
+        (remaining args: TQ config parameters)
+
+    Returns:
+        key: (total_tokens, Hk, D) float16 dequantized keys.
+        value: (total_tokens, Hk, D) float16 dequantized values.
+    """
+    block_size = kv_cache.shape[1]
+    B = len(seq_lens)
+    max_seq_len = max(seq_lens) if seq_lens else 0
+    max_blocks = block_table.shape[1]
+
+    all_keys = []
+    all_values = []
+
+    for b in range(B):
+        seq_len = seq_lens[b]
+        if seq_len <= 0:
+            continue
+
+        # Gather blocks for this sequence
+        block_ids = block_table[b, : (seq_len + block_size - 1) // block_size]
+        gathered = kv_cache[block_ids]  # (n_blocks, block_size, Hk, slot_size)
+        # Flatten to (seq_len_padded, Hk, slot_size)
+        gathered = gathered.reshape(-1, num_kv_heads, kv_cache.shape[3])
+        gathered = gathered[:seq_len]  # (seq_len, Hk, slot_size)
+
+        # Dequantize key per head
+        k_list = []
+        v_list = []
+        for h in range(num_kv_heads):
+            slot_h = gathered[:, h, :]  # (seq_len, slot_size)
+
+            if key_fp8:
+                k = _unpack_fp8_key(slot_h, head_dim)
+            else:
+                k = _unpack_mse_key(
+                    slot_h, centroids, mse_bits, mse_bytes, head_dim, norm_correction
+                )
+
+            # Inverse Hadamard rotation for MSE keys: k_orig = k_recon @ Pi
+            if not key_fp8 and Pi is not None:
+                k = (k.float() @ Pi).to(torch.float16)
+
+            v = _unpack_value(slot_h, key_packed_size, value_quant_bits, val_data_bytes, head_dim)
+
+            k_list.append(k)
+            v_list.append(v)
+
+        # Stack heads: (seq_len, Hk, D)
+        keys_b = torch.stack(k_list, dim=1)
+        values_b = torch.stack(v_list, dim=1)
+        all_keys.append(keys_b)
+        all_values.append(values_b)
+
+    if not all_keys:
+        empty = torch.zeros(0, num_kv_heads, head_dim, dtype=torch.float16, device=kv_cache.device)
+        return empty, empty
+
+    key = torch.cat(all_keys, dim=0)
+    value = torch.cat(all_values, dim=0)
+    return key, value
+
+
+def npu_turboquant_decode_attention(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    scale: float,
+    attn_metadata: object,
+    layer: object,
+    key_fp8: bool,
+    mse_bits: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    head_dim: int,
+    num_kv_heads: int,
+    num_heads: int,
+    centroids: torch.Tensor,
+    norm_correction: bool,
+    Pi: torch.Tensor | None,
+) -> torch.Tensor:
+    """Decode attention for TurboQuant on NPU.
+
+    Strategy: dequantize KV from compressed cache to FP16,
+    then run standard npu_fused_infer_attention_score.
+
+    Args:
+        query: (num_decode_tokens, Hq, D) float16 query.
+        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8 TQ cache.
+        block_table: (B, max_num_blocks) int32.
+        seq_lens: list of sequence lengths per request.
+        scale: attention scale (1/sqrt(D)).
+        (remaining args: TQ config + layer params)
+
+    Returns:
+        output: (num_decode_tokens, Hq, D) float16.
+    """
+    B = block_table.shape[0]
+    D = head_dim
+    device = query.device
+
+    mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
+    val_data_bytes = math.ceil(D * value_quant_bits / 8)
+
+    # Dequantize all cached KV for all requests
+    key_dequant, value_dequant = _gather_and_dequant_kv(
+        kv_cache, block_table, seq_lens,
+        num_kv_heads, D,
+        key_fp8, mse_bits, mse_bytes,
+        key_packed_size, value_quant_bits, val_data_bytes,
+        centroids, norm_correction, Pi,
+    )
+
+    if key_dequant.numel() == 0:
+        return query.new_zeros(query.shape[0], num_heads, D)
+
+    # Use npu_fused_infer_attention_score with BNSD layout
+    # We have per-request variable length KV, so use varlen API
+    # Reconstruct cu_seqlens_k from seq_lens
+    cu_seqlens_k = [0]
+    for s in seq_lens:
+        cu_seqlens_k.append(cu_seqlens_k[-1] + s)
+    cu_seqlens_k_tensor = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
+
+    # For decode, each request has 1 query token
+    cu_seqlens_q = torch.arange(0, B + 1, dtype=torch.int32, device=device)
+
+    # Reshape for FIA: (total_kv, Hk, D) -> (1, total_kv, Hk, D) BNSD
+    key_bnsd = key_dequant.unsqueeze(0)
+    value_bnsd = value_dequant.unsqueeze(0)
+
+    # Query: (B, Hq, D) -> (1, B, Hq, D)
+    query_bnsd = query[:B].unsqueeze(0)
+
+    max_seqlen_q = 1
+    max_seqlen_k = max(seq_lens) if seq_lens else 0
+
+    output, _ = torch_npu.npu_fused_infer_attention_score(
+        query_bnsd,
+        key_bnsd,
+        value_bnsd,
+        scale=scale,
+        input_layout="BSND",
+        actual_seq_lengths=cu_seqlens_q.tolist(),
+        actual_seq_lengths_kv=cu_seqlens_k.tolist(),
+    )
+
+    # output shape: (1, B, Hq, D) -> (B, Hq, D)
+    return output.squeeze(0)
+
+
+def npu_turboquant_full_dequant_kv(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    num_kv_heads: int,
+    head_dim: int,
+    key_fp8: bool,
+    mse_bits: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    val_data_bytes: int,
+    centroids: torch.Tensor,
+    norm_correction: bool,
+    Pi: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full dequantization of all cached KV for continuation prefill.
+
+    Returns per-request batched K, V tensors for use with flash attention.
+
+    Returns:
+        key: (total_tokens, Hk, D) float16.
+        value: (total_tokens, Hk, D) float16.
+    """
+    mse_bytes = math.ceil(head_dim * mse_bits / 8) if not key_fp8 else 0
+
+    return _gather_and_dequant_kv(
+        kv_cache, block_table, seq_lens,
+        num_kv_heads, head_dim,
+        key_fp8, mse_bits, mse_bytes,
+        key_packed_size, value_quant_bits, val_data_bytes,
+        centroids, norm_correction, Pi,
+    )

@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -3269,6 +3270,32 @@ class NPUModelRunner(GPUModelRunner):
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
                 if isinstance(current_kv_cache_spec, AttentionSpec):
+                    # TurboQuant: single combined KV cache tensor with custom slot layout.
+                    # Unlike standard attention (K/V split into 2 tensors), TQ uses one
+                    # tensor of shape (num_blocks, block_size, Hk, slot_size) as uint8.
+                    if isinstance(current_kv_cache_spec, TQFullAttentionSpec):
+                        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
+                            layer_name
+                        ]
+                        assert raw_k_tensor is not None
+                        assert raw_v_tensor is not None
+                        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                        num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                        assert num_blocks >= kv_cache_config.num_blocks
+
+                        tq_slot_size = current_kv_cache_spec.tq_slot_size
+                        tq_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            tq_slot_size,
+                        )
+                        # Combine K and V raw tensors into single uint8 cache
+                        combined = torch.cat([raw_k_tensor, raw_v_tensor])
+                        tq_cache = combined.view(torch.uint8).view(tq_shape)
+                        kv_caches[layer_name] = (tq_cache,)
+                        continue
+
                     if self.use_sparse:
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(current_kv_cache_spec)
                         if current_sparse_c8:

@@ -596,6 +596,12 @@ class NPUPlatform(Platform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
+        # TurboQuant: independent backend with custom cache layout.
+        # Only activated when --kv-cache-dtype starts with "turboquant_".
+        kv_cache_dtype = attn_selector_config.kv_cache_dtype
+        if kv_cache_dtype is not None and kv_cache_dtype.startswith("turboquant_"):
+            return "vllm_ascend.attention.turboquant_attn.AscendTurboQuantBackend"
+
         key = (attn_selector_config.use_mla, attn_selector_config.use_sparse)
 
         backend_map = {
