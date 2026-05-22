@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Patches for vllm attention selector/registry to accept turboquant backends.
 
-Two changes:
+Three changes:
 1. Extend CacheDType Literal to include turboquant values so the assertion
    in get_attn_backend passes naturally.
 2. Patch AttentionBackendEnum to accept "TURBOQUANT" lookups by redirecting
    to the CUSTOM sentinel member.
+3. Patch get_attention_context to unwrap single-element tuple kv_cache
+   (used by turboquant) so downstream code can access .device/.dtype.
 """
 
 from typing import Literal, get_args
@@ -57,3 +59,28 @@ def _patched_enum_getitem(cls, name):
 
 
 _EnumMeta.__getitem__ = _patched_enum_getitem
+
+# ---------------------------------------------------------------------------
+# 3. Patch get_attention_context for tuple kv_cache
+# ---------------------------------------------------------------------------
+# TurboQuant stores kv_cache as a 1-tuple (combined_tensor,).  Code in
+# attention.py (e.g. unified_kv_cache_update line 734) does
+# `kv_cache.device` which fails on a tuple.  We patch get_attention_context
+# to unwrap single-element tuples so downstream sees a plain tensor.
+import vllm.model_executor.layers.attention.attention as _attn_mod
+
+_orig_get_attn_ctx = _attn_mod.get_attention_context
+
+
+def _patched_get_attn_ctx(layer_name):
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = (
+        _orig_get_attn_ctx(layer_name)
+    )
+    # Unwrap 1-element tuple (turboquant combined cache) so that
+    # downstream .device / .dtype access works.
+    if isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 1:
+        kv_cache = kv_cache[0]
+    return attn_metadata, attn_layer, kv_cache, layer_slot_mapping
+
+
+_attn_mod.get_attention_context = _patched_get_attn_ctx
