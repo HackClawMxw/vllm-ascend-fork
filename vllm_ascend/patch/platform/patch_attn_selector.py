@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Extend CacheDType to include turboquant cache dtype strings.
+"""Patches for vllm attention selector/registry to accept turboquant backends.
 
-vllm's selector.py asserts kv_cache_dtype must be in get_args(CacheDType).
-The deployed vllm base does not include turboquant in CacheDType, so this
-extension makes the assertion pass naturally for turboquant values.
-
-Instead of wrapping get_attn_backend (which requires duplicating version-
-specific AttentionSelectorConfig fields), we extend the CacheDType Literal
-type so the original function's assertion passes without modification.
+Two changes:
+1. Extend CacheDType Literal to include turboquant values so the assertion
+   in get_attn_backend passes naturally.
+2. Patch AttentionBackendEnum to accept "TURBOQUANT" lookups by redirecting
+   to the CUSTOM sentinel member.
 """
 
 from typing import Literal, get_args
 
 from vllm.config import cache as _cache_mod
 
+# ---------------------------------------------------------------------------
+# 1. Extend CacheDType to include turboquant values
+# ---------------------------------------------------------------------------
 _orig_args = get_args(_cache_mod.CacheDType)
 
 _TQ_DTYPES = (
@@ -35,3 +36,24 @@ if not any(isinstance(a, str) and a.startswith("turboquant_") for a in _orig_arg
     import vllm.v1.attention.selector as _selector_mod
 
     _selector_mod.CacheDType = _expanded
+
+# ---------------------------------------------------------------------------
+# 2. Patch AttentionBackendEnum to accept "TURBOQUANT"
+# ---------------------------------------------------------------------------
+# attention.py does: self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
+# The deployed vllm base (v0.19.1) does not have TURBOQUANT as an enum member,
+# but it does have CUSTOM.  We patch the metaclass __getitem__ to redirect
+# "TURBOQUANT" lookups to CUSTOM.
+import vllm.v1.attention.backends.registry as _registry
+
+_EnumMeta = type(_registry.AttentionBackendEnum)
+_orig_enum_getitem = _EnumMeta.__getitem__
+
+
+def _patched_enum_getitem(cls, name):
+    if name == "TURBOQUANT":
+        return cls.CUSTOM
+    return _orig_enum_getitem(cls, name)
+
+
+_EnumMeta.__getitem__ = _patched_enum_getitem
