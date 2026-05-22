@@ -3,30 +3,41 @@
 """Patch CacheConfig and dtype mappings to accept TurboQuant cache dtypes.
 
 Two changes:
-1. Widen CacheConfig.cache_dtype annotation from CacheDType Literal to str
-   so Pydantic validation accepts turboquant_* values.
+1. Bypass pydantic Literal validation for turboquant_* cache_dtype values
+   by temporarily substituting "auto" during CacheConfig construction, then
+   restoring the real value via object.__setattr__.
 2. Register turboquant dtype strings in vllm's STR_DTYPE_TO_TORCH_DTYPE
    so kv_cache_dtype_str_to_dtype() can resolve them to torch.uint8.
 
-CacheConfig is a pydantic dataclass (via vllm's @config decorator), NOT a
-BaseModel, so we use __pydantic_fields__ and rebuild_dataclass().
+CacheConfig is a pydantic dataclass (via vllm's @config decorator).  The
+compiled pydantic-core validator uses the original Literal type and cannot
+be reliably rebuilt at runtime, so we wrap __init__ instead.
 """
 
 import torch
 from vllm.config.cache import CacheConfig
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
-# --- 1. Widen CacheConfig.cache_dtype to accept turboquant strings ---
-_field_info = CacheConfig.__pydantic_fields__["cache_dtype"]
-_field_info.annotation = str
+# --- 1. Bypass pydantic Literal validation for turboquant cache_dtype ---
+_TQ_PREFIX = "turboquant_"
+_pydantic_init = CacheConfig.__init__
 
-try:
-    from pydantic.dataclasses import rebuild_dataclass  # type: ignore
-    rebuild_dataclass(CacheConfig, force=True)
-except Exception:
-    # If rebuild fails, the annotation change on FieldInfo may still be
-    # picked up by the existing validators in some pydantic versions.
-    pass
+
+def _patched_init(self, *args, **kwargs):
+    cache_dtype = kwargs.get("cache_dtype")
+    is_tq = (
+        isinstance(cache_dtype, str)
+        and cache_dtype.startswith(_TQ_PREFIX)
+    )
+    if is_tq:
+        kwargs["cache_dtype"] = "auto"
+        _pydantic_init(self, *args, **kwargs)
+        object.__setattr__(self, "cache_dtype", cache_dtype)
+    else:
+        _pydantic_init(self, *args, **kwargs)
+
+
+CacheConfig.__init__ = _patched_init
 
 # --- 2. Register turboquant dtype -> torch.uint8 mappings ---
 _TQ_DTYPES = {
