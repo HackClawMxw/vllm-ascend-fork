@@ -96,3 +96,13 @@ def _patched_get_attn_backend(
 
 
 _selector.get_attn_backend = _patched_get_attn_backend
+
+# Also patch any existing reference in attention.py (e.g. if it was already
+# imported by a previously-loaded patch).  ``from X import f`` creates a local
+# binding that is NOT updated by patching the source module, so we must update
+# both locations.
+import sys
+
+_attn_mod_name = "vllm.model_executor.layers.attention.attention"
+if _attn_mod_name in sys.modules:
+    sys.modules[_attn_mod_name].get_attn_backend = _patched_get_attn_backend
