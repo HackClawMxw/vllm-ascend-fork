@@ -7,19 +7,28 @@ Two changes:
    so Pydantic validation accepts turboquant_* values.
 2. Register turboquant dtype strings in vllm's STR_DTYPE_TO_TORCH_DTYPE
    so kv_cache_dtype_str_to_dtype() can resolve them to torch.uint8.
+
+CacheConfig is a pydantic dataclass (via vllm's @config decorator), NOT a
+BaseModel, so we use __pydantic_fields__ and rebuild_dataclass().
 """
 
 import torch
-import vllm.config.cache as _cache_mod
 from vllm.config.cache import CacheConfig
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
 # --- 1. Widen CacheConfig.cache_dtype to accept turboquant strings ---
-_original_field = CacheConfig.model_fields["cache_dtype"]
-_original_field.annotation = str
-CacheConfig.model_rebuild(force=True)
+_field_info = CacheConfig.__pydantic_fields__["cache_dtype"]
+_field_info.annotation = str
 
-# --- 2. Register turboquant dtype → torch.uint8 mappings ---
+try:
+    from pydantic.dataclasses import rebuild_dataclass  # type: ignore
+    rebuild_dataclass(CacheConfig, force=True)
+except Exception:
+    # If rebuild fails, the annotation change on FieldInfo may still be
+    # picked up by the existing validators in some pydantic versions.
+    pass
+
+# --- 2. Register turboquant dtype -> torch.uint8 mappings ---
 _TQ_DTYPES = {
     "turboquant_k8v4": torch.uint8,
     "turboquant_4bit_nc": torch.uint8,
