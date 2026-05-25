@@ -71,7 +71,7 @@ def _unpack_mse_key(
                 idx = (raw_16[..., byte_idx] >> bit_off) & 0x7
             else:
                 idx = ((raw_16[..., byte_idx] >> bit_off) |
-                       (raw_16[..., byte_idx + 1] << (8 - bit_off))) & 0x7
+                       (raw_16[..., byte_idx + 1] * (1 << (8 - bit_off)))) & 0x7
             indices_list.append(idx)
         indices = torch.stack(indices_list, dim=-1).reshape(
             *slot_data.shape[:-1], head_dim
@@ -91,9 +91,9 @@ def _unpack_mse_key(
         key = key * c_inv_norm
 
     # Load and apply vec_norm (fp16 at MSE_BYTES offset, little-endian 2 bytes)
-    norm_lo = slot_data[..., mse_bytes].to(torch.uint16)
-    norm_hi = slot_data[..., mse_bytes + 1].to(torch.uint16)
-    vec_norm = ((norm_lo | (norm_hi << 8)).view(torch.float16)).to(torch.float32)
+    # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
+    norm_bytes = slot_data[..., mse_bytes:mse_bytes + 2].contiguous()
+    vec_norm = norm_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
     vec_norm = vec_norm.unsqueeze(-1)  # broadcast over head_dim
 
     key = vec_norm * key
@@ -167,7 +167,7 @@ def _unpack_value(
                 idx = (raw_16[..., byte_idx] >> bit_off) & 0x7
             else:
                 idx = ((raw_16[..., byte_idx] >> bit_off) |
-                       (raw_16[..., byte_idx + 1] << (8 - bit_off))) & 0x7
+                       (raw_16[..., byte_idx + 1] * (1 << (8 - bit_off)))) & 0x7
             indices_list.append(idx)
         v_indices = torch.stack(indices_list, dim=-1).reshape(
             *slot_data.shape[:-1], head_dim
@@ -178,14 +178,13 @@ def _unpack_value(
     v_indices = v_indices.to(torch.float32)
 
     # Load scale and zero (fp16, 4 bytes total at val_data_bytes offset)
+    # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
     sc_base = key_packed_size + val_data_bytes
-    sc_lo = slot_data[..., sc_base].to(torch.uint16)
-    sc_hi = slot_data[..., sc_base + 1].to(torch.uint16)
-    v_scale = ((sc_lo | (sc_hi << 8)).view(torch.float16)).to(torch.float32)
+    sc_bytes = slot_data[..., sc_base:sc_base + 2].contiguous()
+    v_scale = sc_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
 
-    zr_lo = slot_data[..., sc_base + 2].to(torch.uint16)
-    zr_hi = slot_data[..., sc_base + 3].to(torch.uint16)
-    v_zero = ((zr_lo | (zr_hi << 8)).view(torch.float16)).to(torch.float32)
+    zr_bytes = slot_data[..., sc_base + 2:sc_base + 4].contiguous()
+    v_zero = zr_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
 
     # Dequantize: value = index * scale + zero
     value = v_indices * v_scale.unsqueeze(-1) + v_zero.unsqueeze(-1)
