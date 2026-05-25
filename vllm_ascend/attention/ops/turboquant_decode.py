@@ -333,35 +333,24 @@ def npu_turboquant_decode_attention(
     if key_dequant.numel() == 0:
         return query.new_zeros(query.shape[0], num_heads, D)
 
-    # Use npu_fused_infer_attention_score with BNSD layout
-    # We have per-request variable length KV, so use varlen API
-    # Reconstruct cu_seqlens_k from seq_lens
-    cu_seqlens_k = [0]
-    for s in seq_lens:
-        cu_seqlens_k.append(cu_seqlens_k[-1] + s)
-    cu_seqlens_k_tensor = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=device)
-
-    # For decode, each request has 1 query token
-    cu_seqlens_q = torch.arange(0, B + 1, dtype=torch.int32, device=device)
-
-    # Reshape for FIA: (total_kv, Hk, D) -> (1, total_kv, Hk, D) BNSD
+    # Reshape for FIA: (total_kv, Hk, D) -> (1, total_kv, Hk, D) BSND
     key_bnsd = key_dequant.unsqueeze(0)
     value_bnsd = value_dequant.unsqueeze(0)
 
     # Query: (B, Hq, D) -> (1, B, Hq, D)
     query_bnsd = query[:B].unsqueeze(0)
 
-    max_seqlen_q = 1
-    max_seqlen_k = max(seq_lens) if seq_lens else 0
-
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query_bnsd,
         key_bnsd,
         value_bnsd,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
         scale=scale,
         input_layout="BSND",
-        actual_seq_lengths=cu_seqlens_q.tolist(),
-        actual_seq_lengths_kv=cu_seqlens_k.tolist(),
+        sparse_mode=0,
+        actual_seq_lengths=[1] * B,
+        actual_seq_lengths_kv=seq_lens,
     )
 
     # output shape: (1, B, Hq, D) -> (B, Hq, D)

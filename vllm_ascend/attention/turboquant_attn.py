@@ -461,7 +461,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                   for i in range(len(cu_seqlens_q) - 1)]
         k_lens = [cu_seqlens_k[i + 1] - cu_seqlens_k[i]
                   for i in range(len(cu_seqlens_k) - 1)]
-        max_len = max(k_lens) if k_lens else 1
         attn_mask = self._get_causal_mask(cat_q.device)
 
         output, _ = torch_npu.npu_fused_infer_attention_score(
