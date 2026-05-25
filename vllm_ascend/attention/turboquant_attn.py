@@ -214,6 +214,17 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             layer._tq_PiT = H
             layer._tq_Pi = H
 
+            # Centroids are normally registered as a buffer by
+            # Attention._init_turboquant_buffers (vllm GPU).  The deployed
+            # v0.19.1 base does not have that method, so we compute them
+            # lazily on first use.
+            if not hasattr(layer, "_tq_centroids"):
+                from vllm_ascend.attention.tq_centroids import get_centroids
+                layer.register_buffer(
+                    "_tq_centroids",
+                    get_centroids(D, self.tq_config.centroid_bits).to(device),
+                )
+
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             c_sorted, _ = c.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
