@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Patches for vllm attention selector/registry to accept turboquant backends.
 
-Three changes:
+Four changes:
 1. Extend CacheDType Literal to include turboquant values so the assertion
    in get_attn_backend passes naturally.
 2. Patch AttentionBackendEnum to accept "TURBOQUANT" lookups by redirecting
    to the CUSTOM sentinel member.
 3. Patch get_attention_context to unwrap single-element tuple kv_cache
    (used by turboquant) so downstream code can access .device/.dtype.
+4. Register TQFullAttentionSpec in spec_manager_map so that
+   get_manager_for_kv_cache_spec() can dispatch to FullAttentionManager.
 """
 
 from typing import Literal, get_args
@@ -84,3 +86,17 @@ def _patched_get_attn_ctx(layer_name):
 
 
 _attn_mod.get_attention_context = _patched_get_attn_ctx
+
+# ---------------------------------------------------------------------------
+# 4. Register TQFullAttentionSpec in spec_manager_map
+# ---------------------------------------------------------------------------
+# The deployed vllm base (v0.19.1) does not have TQFullAttentionSpec in its
+# spec_manager_map.  get_manager_for_kv_cache_spec() uses type() exact match,
+# so our local TQFullAttentionSpec subclass must be explicitly registered.
+# Same pattern as recompute_scheduler.py's register_ascend_mla_spec_in_manager.
+import vllm.v1.core.single_type_kv_cache_manager as _kv_cache_mgr
+
+from vllm_ascend.attention.tq_spec import TQFullAttentionSpec as _TQSpec
+
+if _TQSpec not in _kv_cache_mgr.spec_manager_map:
+    _kv_cache_mgr.spec_manager_map[_TQSpec] = _kv_cache_mgr.FullAttentionManager
