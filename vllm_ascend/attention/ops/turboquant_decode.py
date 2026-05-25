@@ -332,28 +332,22 @@ def npu_turboquant_decode_attention(
     if key_dequant.numel() == 0:
         return query.new_zeros(query.shape[0], num_heads, D)
 
-    # Reshape for FIA: (total_kv, Hk, D) -> (1, total_kv, Hk, D) BSND
-    key_bnsd = key_dequant.unsqueeze(0)
-    value_bnsd = value_dequant.unsqueeze(0)
-
-    # Query: (B, Hq, D) -> (1, B, Hq, D)
-    query_bnsd = query[:B].unsqueeze(0)
-
+    # Use TND layout so FIA handles GQA via num_heads/num_key_value_heads.
+    # BSND without block_table requires value heads == query heads.
     output, _ = torch_npu.npu_fused_infer_attention_score(
-        query_bnsd,
-        key_bnsd,
-        value_bnsd,
+        query[:B],
+        key_dequant,
+        value_dequant,
         num_heads=num_heads,
         num_key_value_heads=num_kv_heads,
         scale=scale,
-        input_layout="BSND",
+        input_layout="TND",
         sparse_mode=0,
         actual_seq_lengths=[1] * B,
         actual_seq_lengths_kv=seq_lens,
     )
 
-    # output shape: (1, B, Hq, D) -> (B, Hq, D)
-    return output.squeeze(0)
+    return output
 
 
 def npu_turboquant_full_dequant_kv(
