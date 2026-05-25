@@ -205,6 +205,20 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
 
         self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
         self._val_data_bytes = math.ceil(head_size * self.tq_config.effective_value_quant_bits / 8)
+        self._causal_mask_cache = None  # (mask_tensor, max_len)
+
+    def _get_causal_mask(self, max_len: int, device: torch.device):
+        """Return an upper-triangular causal mask of at least max_len size."""
+        cached, cached_len = self._causal_mask_cache or (None, 0)
+        if cached is None or cached_len < max_len:
+            size = max(max_len, 2048)
+            cached = torch.triu(
+                torch.ones(size, size, dtype=torch.int8), diagonal=1,
+            ).to(device)
+            self._causal_mask_cache = (cached, size)
+        elif cached.device != device:
+            cached = cached.to(device)
+        return cached[:max_len, :max_len]
 
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints)."""
@@ -448,6 +462,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                   for i in range(len(cu_seqlens_q) - 1)]
         k_lens = [cu_seqlens_k[i + 1] - cu_seqlens_k[i]
                   for i in range(len(cu_seqlens_k) - 1)]
+        max_len = max(k_lens) if k_lens else 1
+        attn_mask = self._get_causal_mask(max_len, cat_q.device)
 
         output, _ = torch_npu.npu_fused_infer_attention_score(
             cat_q, cat_k, cat_v,
@@ -455,7 +471,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             num_key_value_heads=self.num_kv_heads,
             input_layout="TND",
             scale=self.scale,
-            sparse_mode=3,  # causal
+            sparse_mode=3,
+            atten_mask=attn_mask,
             actual_seq_lengths=q_lens,
             actual_seq_lengths_kv=k_lens,
         )
@@ -465,6 +482,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
     def _flash_attn_varlen(self, q, k, v, attn_metadata):
         """First-chunk prefill using NPU fused attention."""
         seq_lens = attn_metadata.seq_lens.tolist()
+        max_len = max(seq_lens) if seq_lens else 1
+        attn_mask = self._get_causal_mask(max_len, q.device)
 
         output, _ = torch_npu.npu_fused_infer_attention_score(
             q, k, v,
@@ -472,7 +491,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             num_key_value_heads=self.num_kv_heads,
             input_layout="TND",
             scale=self.scale,
-            sparse_mode=3,  # causal
+            sparse_mode=3,
+            atten_mask=attn_mask,
             actual_seq_lengths=seq_lens,
             actual_seq_lengths_kv=seq_lens,
         )
