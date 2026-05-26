@@ -87,19 +87,35 @@ def _unpack_mse_key(
     # Gather centroids
     key = centroids[indices]
 
+    # ---- TQ SHAPE TRACE ----
+    _trace = (slot_data.shape[0] > 1)  # only trace during decode (multi-position)
+    if _trace:
+        print(f"[TQ-SHAPE] slot_data={slot_data.shape} indices={indices.shape} "
+              f"key_after_centroids={key.shape}")
+    # ---- END TQ SHAPE TRACE ----
+
     # Norm correction: re-normalize centroid vector to unit norm
     if norm_correction:
         c_norm_sq = (key * key).sum(dim=-1, keepdim=True)
         c_inv_norm = 1.0 / torch.sqrt(c_norm_sq + 1e-16)
         key = key * c_inv_norm
+        if _trace:
+            print(f"[TQ-SHAPE] c_norm_sq={c_norm_sq.shape} c_inv_norm={c_inv_norm.shape} "
+                  f"key_after_normcorr={key.shape}")
 
     # Load and apply vec_norm (fp16 at MSE_BYTES offset, little-endian 2 bytes)
     # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
     # vec_norm shape: (..., 1) — already broadcasts over head_dim without unsqueeze
     norm_bytes = slot_data[..., mse_bytes:mse_bytes + 2].contiguous()
     vec_norm = norm_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
+    if _trace:
+        print(f"[TQ-SHAPE] norm_bytes={norm_bytes.shape} "
+              f"after_view_u16={norm_bytes.view(torch.uint16).shape} "
+              f"vec_norm={vec_norm.shape}")
 
     key = vec_norm * key
+    if _trace:
+        print(f"[TQ-SHAPE] key_final={key.shape}")
 
     return key.to(torch.float16)
 
@@ -369,6 +385,14 @@ def npu_turboquant_decode_attention(
             v = _unpack_value(
                 slot_h, key_packed_size, value_quant_bits, val_data_bytes, D
             )
+
+            # Shape assertion: catch unexpected dimensions from NPU ops
+            if k.ndim != 2 or k.shape != (block_size, D):
+                print(f"[TQ-DIAG-SHAPE] BAD k shape={k.shape} expected=({block_size},{D}) "
+                      f"slot_h={slot_h.shape} i={i} h={h}")
+            if v.ndim != 2 or v.shape != (block_size, D):
+                print(f"[TQ-DIAG-SHAPE] BAD v shape={v.shape} expected=({block_size},{D}) "
+                      f"slot_h={slot_h.shape} i={i} h={h}")
 
             key_cache_fp16[i, :, h * D : (h + 1) * D] = k
             value_cache_fp16[i, :, h * D : (h + 1) * D] = v
