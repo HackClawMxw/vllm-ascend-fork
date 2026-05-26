@@ -267,6 +267,14 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
         self._store_kv(k, v, kv_cache, slot_mapping, layer)
 
+        # ---- TQ DIAGNOSTIC: store round-trip verification ----
+        if not getattr(self, '_tq_diag_store_done', False):
+            self._tq_diag_store_done = True
+            self._diag_store_roundtrip(
+                k, v, kv_cache, slot_mapping, layer, N,
+            )
+        # ---- END TQ DIAGNOSTIC ----
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -372,6 +380,101 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         else:
             output[:N] = attn_out.reshape(N, -1).to(output.dtype)
         return output
+
+    # ------------------------------------------------------------------ #
+    #  Store-side round-trip diagnostic                                    #
+    # ------------------------------------------------------------------ #
+    def _diag_store_roundtrip(self, k, v, kv_cache, slot_mapping, layer, N):
+        """Verify store→unpack round-trip for the first valid token."""
+        import math as _math
+        from vllm_ascend.attention.ops.turboquant_decode import (
+            _unpack_mse_key, _unpack_fp8_key, _unpack_value,
+        )
+
+        tq = self.tq_config
+        block_size = kv_cache.shape[1]
+        mse_bits = tq.key_mse_bits
+        key_fp8 = tq.key_fp8
+        mse_bytes = _math.ceil(self.head_size * mse_bits / 8) if not key_fp8 else 0
+        val_data_bytes = _math.ceil(
+            self.head_size * tq.effective_value_quant_bits / 8
+        )
+        centroids = layer._tq_centroids
+        Pi = layer._tq_Pi
+
+        valid_mask = slot_mapping >= 0
+        if not valid_mask.any():
+            return
+
+        first_idx = valid_mask.nonzero()[0, 0].item()
+        slot_idx = slot_mapping[first_idx].item()
+        bid = slot_idx // block_size
+        pid = slot_idx % block_size
+
+        print(f"[TQ-DIAG-STORE] token={first_idx} slot={slot_idx} "
+              f"block={bid} pos={pid} block_size={block_size} "
+              f"slot_size={kv_cache.shape[-1]}")
+        print(f"[TQ-DIAG-STORE] mse_bits={mse_bits} mse_bytes={mse_bytes} "
+              f"key_packed_size={tq.key_packed_size} val_data_bytes={val_data_bytes} "
+              f"key_fp8={key_fp8} norm_corr={tq.norm_correction}")
+        print(f"[TQ-DIAG-STORE] centroids[:4]={centroids[:4].tolist()}")
+
+        for h in range(min(self.num_kv_heads, 2)):
+            slot_h = kv_cache[bid, pid, h, :]  # (slot_size,) uint8
+
+            # --- Dequantize key ---
+            if key_fp8:
+                k_deq = _unpack_fp8_key(
+                    slot_h.unsqueeze(0), self.head_size
+                ).squeeze(0)
+            else:
+                k_deq = _unpack_mse_key(
+                    slot_h.unsqueeze(0), centroids, mse_bits, mse_bytes,
+                    self.head_size, tq.norm_correction,
+                ).squeeze(0)
+                if Pi is not None:
+                    k_deq = (k_deq.float() @ Pi).to(torch.float16)
+
+            # --- Dequantize value ---
+            v_deq = _unpack_value(
+                slot_h.unsqueeze(0), tq.key_packed_size,
+                tq.effective_value_quant_bits, val_data_bytes,
+                self.head_size,
+            ).squeeze(0)
+
+            k_orig = k[first_idx, h, :].detach().float()
+            v_orig = v[first_idx, h, :].detach().float()
+            k_deq_f = k_deq.float()
+            v_deq_f = v_deq.float()
+
+            k_err = (k_orig - k_deq_f).abs()
+            v_err = (v_orig - v_deq_f).abs()
+
+            # vec_norm vs original norm
+            if not key_fp8:
+                nb = slot_h[mse_bytes:mse_bytes + 2].contiguous()
+                vn = nb.view(torch.uint16).view(torch.float16).to(torch.float32).item()
+                no = k_orig.norm().item()
+                print(f"[TQ-DIAG-STORE] head={h} vec_norm={vn:.6f} "
+                      f"orig_norm={no:.6f} ratio={vn / (no + 1e-8):.4f}")
+
+            # Cosine similarity (direction quality)
+            cos_sim = torch.nn.functional.cosine_similarity(
+                k_orig.unsqueeze(0), k_deq_f.unsqueeze(0)
+            ).item()
+
+            print(f"[TQ-DIAG-STORE] head={h} key_err max={k_err.max().item():.6f} "
+                  f"mean={k_err.mean().item():.6f} cos_sim={cos_sim:.6f}")
+            print(f"[TQ-DIAG-STORE] head={h} val_err max={v_err.max().item():.6f} "
+                  f"mean={v_err.mean().item():.6f}")
+
+            if h == 0:
+                print(f"[TQ-DIAG-STORE] k_orig[:8] ={k_orig[:8].tolist()}")
+                print(f"[TQ-DIAG-STORE] k_deq[:8]  ={k_deq_f[:8].tolist()}")
+                print(f"[TQ-DIAG-STORE] v_orig[:8] ={v_orig[:8].tolist()}")
+                print(f"[TQ-DIAG-STORE] v_deq[:8]  ={v_deq_f[:8].tolist()}")
+                # Raw slot hex dump (first 16 bytes)
+                print(f"[TQ-DIAG-STORE] slot_raw[:16]={slot_h[:16].tolist()}")
 
     # ------------------------------------------------------------------ #
     #  Store K/V into combined cache                                      #

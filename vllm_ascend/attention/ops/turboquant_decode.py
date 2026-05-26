@@ -17,6 +17,9 @@ import math
 import torch
 import torch_npu
 
+# Module-level flag for one-shot decode diagnostic
+_diag_decode_done = False
+
 
 def _unpack_mse_key(
     slot_data: torch.Tensor,
@@ -374,6 +377,48 @@ def npu_turboquant_decode_attention(
     bt_clamped = block_table.clamp(min=0, max=max_id)
     remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
 
+    # ---- TQ DIAGNOSTIC: decode pre-FIA check ----
+    global _diag_decode_done
+    _do_diag = not _diag_decode_done
+    if _do_diag:
+        kcf = key_cache_fp16.float()
+        vcf = value_cache_fp16.float()
+        qf = query[:B].float()
+        print(f"[TQ-DIAG-DECODE] B={B} n_used={n_used} block_size={block_size} "
+              f"D={D} Hk={num_kv_heads} Hq={num_heads}")
+        print(f"[TQ-DIAG-DECODE] key_cache_fp16 shape={key_cache_fp16.shape} "
+              f"mean={kcf.mean().item():.6f} max={kcf.max().item():.6f} "
+              f"min={kcf.min().item():.6f}")
+        print(f"[TQ-DIAG-DECODE] value_cache_fp16 shape={value_cache_fp16.shape} "
+              f"mean={vcf.mean().item():.6f} max={vcf.max().item():.6f} "
+              f"min={vcf.min().item():.6f}")
+        print(f"[TQ-DIAG-DECODE] query shape={query[:B].shape} "
+              f"mean={qf.mean().item():.6f} max={qf.max().item():.6f}")
+        print(f"[TQ-DIAG-DECODE] remapped_bt[0,:8]={remapped_bt[0,:8].tolist()}")
+        print(f"[TQ-DIAG-DECODE] seq_lens={seq_lens}")
+        print(f"[TQ-DIAG-DECODE] used_blocks[:8]={used_blocks[:8].tolist()}")
+        print(f"[TQ-DIAG-DECODE] scale={scale} sparse_mode=0")
+        # Check a single dequantized key/value from the partial cache
+        bid0 = used_blocks[0].item()
+        slot0 = kv_cache[bid0, 0, 0, :]  # pos=0, head=0
+        if not key_fp8:
+            k0 = _unpack_mse_key(
+                slot0.unsqueeze(0), centroids, mse_bits, mse_bytes,
+                D, norm_correction,
+            ).squeeze(0)
+            if Pi is not None:
+                k0 = (k0.float() @ Pi).to(torch.float16)
+            nb = slot0[mse_bytes:mse_bytes+2].contiguous()
+            vn = nb.view(torch.uint16).view(torch.float16).to(torch.float32).item()
+            print(f"[TQ-DIAG-DECODE] sample k[0,0] vec_norm={vn:.6f} "
+                  f"k[:8]={k0[:8].tolist()}")
+        v0 = _unpack_value(
+            slot0.unsqueeze(0), key_packed_size,
+            value_quant_bits, val_data_bytes, D,
+        ).squeeze(0)
+        print(f"[TQ-DIAG-DECODE] sample v[0,0][:8]={v0[:8].tolist()}")
+    # ---- END TQ DIAGNOSTIC ----
+
     # Paged attention via FIA — same pattern as standard AscendAttention
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query[:B],
@@ -389,6 +434,15 @@ def npu_turboquant_decode_attention(
         actual_seq_lengths=[1] * B,
         actual_seq_lengths_kv=seq_lens,
     )
+
+    # ---- TQ DIAGNOSTIC: decode output check ----
+    if _do_diag:
+        _diag_decode_done = True
+        of = output.float()
+        print(f"[TQ-DIAG-DECODE] output shape={output.shape} "
+              f"mean={of.mean().item():.6f} max={of.max().item():.6f} "
+              f"min={of.min().item():.6f}")
+        print(f"[TQ-DIAG-DECODE] output[0,0,:8]={output[0,0,:8].tolist()}")
 
     return output
 
