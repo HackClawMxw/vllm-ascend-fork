@@ -299,54 +299,91 @@ def npu_turboquant_decode_attention(
 ) -> torch.Tensor:
     """Decode attention for TurboQuant on NPU.
 
-    Strategy: dequantize KV from compressed cache to FP16,
-    then run standard npu_fused_infer_attention_score.
+    Strategy: dequantize KV from compressed cache into a temporary
+    paged FP16 cache, then call npu_fused_infer_attention_score with
+    block_table (paged attention).  This matches the pattern used by
+    the standard AscendAttention backend for decode.
 
-    Args:
-        query: (num_decode_tokens, Hq, D) float16 query.
-        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8 TQ cache.
-        block_table: (B, max_num_blocks) int32.
-        seq_lens: list of sequence lengths per request.
-        scale: attention scale (1/sqrt(D)).
-        (remaining args: TQ config + layer params)
+    NPU FIA non-paged mode does NOT support different Q/KV lengths,
+    which is required for decode (1 query token vs many KV tokens).
+    Paged attention with block_table is the only working decode path.
 
     Returns:
         output: (num_decode_tokens, Hq, D) float16.
     """
     B = block_table.shape[0]
     D = head_dim
+    block_size = kv_cache.shape[1]
     device = query.device
 
     mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
     val_data_bytes = math.ceil(D * value_quant_bits / 8)
 
-    # Dequantize all cached KV for all requests
-    key_dequant, value_dequant = _gather_and_dequant_kv(
-        kv_cache, block_table, seq_lens,
-        num_kv_heads, D,
-        key_fp8, mse_bits, mse_bytes,
-        key_packed_size, value_quant_bits, val_data_bytes,
-        centroids, norm_correction, Pi,
-    )
+    # Collect unique block IDs referenced by active sequences
+    active_ids = []
+    for b in range(B):
+        sl = seq_lens[b]
+        if sl <= 0:
+            continue
+        n_blocks = (sl + block_size - 1) // block_size
+        active_ids.append(block_table[b, :n_blocks])
 
-    if key_dequant.numel() == 0:
+    if not active_ids:
         return query.new_zeros(query.shape[0], num_heads, D)
 
-    # NPU FIA without block_table requires value heads == query heads.
-    # Expand KV heads for GQA models: (T, Hk, D) -> (T, Hq, D)
-    if num_kv_heads != num_heads:
-        num_kv_groups = num_heads // num_kv_heads
-        key_dequant = key_dequant.repeat_interleave(num_kv_groups, dim=1)
-        value_dequant = value_dequant.repeat_interleave(num_kv_groups, dim=1)
+    used_blocks = torch.unique(torch.cat(active_ids))
+    n_used = used_blocks.shape[0]
 
+    # Build reverse mapping: original block_id -> index in partial cache
+    max_id = used_blocks.max().item()
+    id_to_idx = torch.full((max_id + 1,), -1, dtype=torch.int32, device=device)
+    for i in range(n_used):
+        id_to_idx[used_blocks[i].item()] = i
+
+    # Dequantize used blocks into paged FP16 format:
+    #   (n_used, block_size, num_kv_heads * head_dim) — flattened heads,
+    #   same layout as standard AscendAttention key_cache.
+    key_cache_fp16 = query.new_empty(n_used, block_size, num_kv_heads * D)
+    value_cache_fp16 = query.new_empty(n_used, block_size, num_kv_heads * D)
+
+    for i in range(n_used):
+        bid = used_blocks[i].item()
+        block_data = kv_cache[bid]  # (block_size, Hk, slot_size)
+
+        for h in range(num_kv_heads):
+            slot_h = block_data[:, h, :]  # (block_size, slot_size)
+
+            if key_fp8:
+                k = _unpack_fp8_key(slot_h, D)
+            else:
+                k = _unpack_mse_key(
+                    slot_h, centroids, mse_bits, mse_bytes, D, norm_correction
+                )
+                if Pi is not None:
+                    k = (k.float() @ Pi).to(torch.float16)
+
+            v = _unpack_value(
+                slot_h, key_packed_size, value_quant_bits, val_data_bytes, D
+            )
+
+            key_cache_fp16[i, :, h * D : (h + 1) * D] = k
+            value_cache_fp16[i, :, h * D : (h + 1) * D] = v
+
+    # Remap block_table: original block IDs -> partial cache indices
+    bt_clamped = block_table.clamp(min=0, max=max_id)
+    remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
+
+    # Paged attention via FIA — same pattern as standard AscendAttention
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query[:B],
-        key_dequant,
-        value_dequant,
+        key_cache_fp16,
+        value_cache_fp16,
         num_heads=num_heads,
-        num_key_value_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
         scale=scale,
         input_layout="TND",
+        block_table=remapped_bt,
+        block_size=block_size,
         sparse_mode=0,
         actual_seq_lengths=[1] * B,
         actual_seq_lengths_kv=seq_lens,
