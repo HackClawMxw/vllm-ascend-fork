@@ -92,9 +92,9 @@ def _unpack_mse_key(
 
     # Load and apply vec_norm (fp16 at MSE_BYTES offset, little-endian 2 bytes)
     # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
+    # vec_norm shape: (..., 1) — already broadcasts over head_dim without unsqueeze
     norm_bytes = slot_data[..., mse_bytes:mse_bytes + 2].contiguous()
     vec_norm = norm_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
-    vec_norm = vec_norm.unsqueeze(-1)  # broadcast over head_dim
 
     key = vec_norm * key
 
@@ -187,7 +187,8 @@ def _unpack_value(
     v_zero = zr_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
 
     # Dequantize: value = index * scale + zero
-    value = v_indices * v_scale.unsqueeze(-1) + v_zero.unsqueeze(-1)
+    # v_scale/v_zero shape: (..., 1) — broadcasts over head_dim without unsqueeze
+    value = v_indices * v_scale + v_zero
     return value.to(torch.float16)
 
 
