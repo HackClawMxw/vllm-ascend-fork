@@ -418,6 +418,7 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             centroids,
             self.tq_config.norm_correction,
             Pi,
+            target_dtype=q.dtype,
         )
 
         # Concatenate dequantized cached KV with current batch KV

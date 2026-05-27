@@ -203,8 +203,9 @@ def _gather_and_dequant_kv(
     centroids: torch.Tensor,
     norm_correction: bool,
     Pi: torch.Tensor | None,
+    target_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather paged KV blocks and dequantize to FP16 (vectorized).
+    """Gather paged KV blocks and dequantize (vectorized).
 
     Builds flat indices for all valid tokens across sequences, gathers
     from the flattened cache in a single operation, then batch-dequantizes
@@ -261,9 +262,9 @@ def _gather_and_dequant_kv(
         flat_data, key_packed_size, value_quant_bits, val_data_bytes, head_dim
     )
 
-    # Reshape to (total_tokens, Hk, D)
-    key = all_keys.reshape(-1, num_kv_heads, head_dim)
-    value = all_values.reshape(-1, num_kv_heads, head_dim)
+    # Reshape to (total_tokens, Hk, D) and cast to target dtype
+    key = all_keys.reshape(-1, num_kv_heads, head_dim).to(target_dtype)
+    value = all_values.reshape(-1, num_kv_heads, head_dim).to(target_dtype)
     return key, value
 
 
@@ -340,9 +341,14 @@ def npu_turboquant_decode_attention(
         flat_data, key_packed_size, value_quant_bits, val_data_bytes, D
     )
 
-    # Reshape to paged FP16 cache format: (n_used, block_size, Hk * D)
-    key_cache_fp16 = all_keys.reshape(n_used, block_size, num_kv_heads * D)
-    value_cache_fp16 = all_values.reshape(n_used, block_size, num_kv_heads * D)
+    # Reshape to paged cache format: (n_used, block_size, Hk * D)
+    key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D)
+    value_cache = all_values.reshape(n_used, block_size, num_kv_heads * D)
+
+    # FIA requires query/key/value to share the same dtype
+    target_dtype = query.dtype
+    key_cache = key_cache.to(target_dtype)
+    value_cache = value_cache.to(target_dtype)
 
     # Build reverse mapping: original block_id -> index in partial cache
     max_id = used_blocks.max().item()
@@ -356,8 +362,8 @@ def npu_turboquant_decode_attention(
     # Paged attention via FIA
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query[:B],
-        key_cache_fp16,
-        value_cache_fp16,
+        key_cache,
+        value_cache,
         num_heads=num_heads,
         num_key_value_heads=num_kv_heads,
         scale=scale,
@@ -386,14 +392,15 @@ def npu_turboquant_full_dequant_kv(
     centroids: torch.Tensor,
     norm_correction: bool,
     Pi: torch.Tensor | None,
+    target_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full dequantization of all cached KV for continuation prefill.
 
     Returns per-request batched K, V tensors for use with flash attention.
 
     Returns:
-        key: (total_tokens, Hk, D) float16.
-        value: (total_tokens, Hk, D) float16.
+        key: (total_tokens, Hk, D) in target_dtype.
+        value: (total_tokens, Hk, D) in target_dtype.
     """
     mse_bytes = math.ceil(head_dim * mse_bits / 8) if not key_fp8 else 0
 
@@ -402,5 +409,5 @@ def npu_turboquant_full_dequant_kv(
         num_kv_heads, head_dim,
         key_fp8, mse_bits, mse_bytes,
         key_packed_size, value_quant_bits, val_data_bytes,
-        centroids, norm_correction, Pi,
+        centroids, norm_correction, Pi, target_dtype,
     )
