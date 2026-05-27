@@ -49,16 +49,18 @@ def _quantize_values_batched(
 
     if value_quant_bits == 4:
         q_pairs = q_vals.view(NH, -1, 2)
-        packed = ((q_pairs[:, :, 0] & 0xF) | ((q_pairs[:, :, 1] & 0xF) << 4)).to(torch.uint8)
+        packed = ((q_pairs[:, :, 0] & 0xF) | ((q_pairs[:, :, 1] & 0xF) * 16)).to(torch.uint8)
         packed = packed.reshape(NH, -1)
     elif value_quant_bits == 3:
         n_groups = D // 8
         q_groups = q_vals.view(NH, n_groups, 8)
         shifts = torch.arange(8, dtype=torch.int32, device=values.device) * 3
-        packed_24 = (q_groups << shifts.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-        b0 = (packed_24 & 0xFF).to(torch.uint8)
-        b1 = ((packed_24 >> 8) & 0xFF).to(torch.uint8)
-        b2 = ((packed_24 >> 16) & 0xFF).to(torch.uint8)
+        # Use power-of-2 multiplication instead of << for NPU graph replay compat
+        p2 = 2 ** shifts  # [1, 8, 64, 512, ...]
+        packed_24 = (q_groups * p2.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
+        b0 = (packed_24 % 256).to(torch.uint8)
+        b1 = ((packed_24 // 256) % 256).to(torch.uint8)
+        b2 = ((packed_24 // 65536) % 256).to(torch.uint8)
         packed = torch.stack([b0, b1, b2], dim=-1).reshape(NH, -1)
     else:
         raise ValueError(f"Unsupported value_quant_bits: {value_quant_bits}")
@@ -70,10 +72,11 @@ def _fp16_to_bytes_batched(x: torch.Tensor) -> torch.Tensor:
     """Convert (NH,) fp16 tensor to (NH, 2) uint8 bytes (little-endian).
 
     Uses bitcast to uint16, then extracts low/high bytes.
+    NPU requires int32 for bitwise ops (uint16 & scalar fails).
     """
-    u16 = x.view(torch.uint16)  # (NH,) uint16
-    lo = (u16 & 0xFF).to(torch.uint8)
-    hi = ((u16 >> 8) & 0xFF).to(torch.uint8)
+    u16 = x.view(torch.uint16).to(torch.int32)  # int32 for NPU bitwise compat
+    lo = (u16 % 256).to(torch.uint8)
+    hi = (u16 // 256).to(torch.uint8)
     return torch.stack([lo, hi], dim=-1)  # (NH, 2)
 
 
@@ -204,10 +207,11 @@ def _store_mse_key_value(
         n_groups = D // 8
         idx_groups = idx.view(NH, n_groups, 8)
         shifts = torch.arange(8, dtype=torch.int32, device=key.device) * 3
-        packed_24 = (idx_groups << shifts.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-        b0 = (packed_24 & 0xFF).to(torch.uint8)
-        b1 = ((packed_24 >> 8) & 0xFF).to(torch.uint8)
-        b2 = ((packed_24 >> 16) & 0xFF).to(torch.uint8)
+        p2 = 2 ** shifts
+        packed_24 = (idx_groups * p2.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
+        b0 = (packed_24 % 256).to(torch.uint8)
+        b1 = ((packed_24 // 256) % 256).to(torch.uint8)
+        b2 = ((packed_24 // 65536) % 256).to(torch.uint8)
         packed_mse = torch.stack([b0, b1, b2], dim=-1).reshape(NH, mse_bytes)
     else:
         raise ValueError(f"Unsupported mse_bits: {mse_bits}")
