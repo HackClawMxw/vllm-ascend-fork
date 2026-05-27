@@ -5,11 +5,11 @@
 Replaces the Triton decode kernels with pure PyTorch operations
 that run on Ascend NPU via torch_npu.
 
-Strategy for Phase 0: dequantize KV from TQ cache to FP16,
+Strategy: dequantize KV from TQ cache to FP16,
 then use npu_fused_infer_attention_score for standard attention.
 
-This is the simplest correct implementation. Performance optimization
-(fused bit-unpack + attention) can be added later as a C++ custom op.
+All per-block / per-head Python loops have been replaced with
+vectorized tensor operations for performance on NPU.
 """
 
 import math
@@ -29,7 +29,7 @@ def _unpack_mse_key(
     """Unpack MSE key indices and reconstruct key vector.
 
     Args:
-        slot_data: (..., slot_size) uint8 slot data for one position/head.
+        slot_data: (..., slot_size) uint8 slot data.
         centroids: (n_centroids,) float32 centroids.
         mse_bits: 3 or 4 bits.
         mse_bytes: bytes for packed MSE indices.
@@ -91,8 +91,6 @@ def _unpack_mse_key(
         key = key * c_inv_norm
 
     # Load and apply vec_norm (fp16 at MSE_BYTES offset, little-endian 2 bytes)
-    # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
-    # vec_norm shape: (..., 1) — already broadcasts over head_dim without unsqueeze
     norm_bytes = slot_data[..., mse_bytes:mse_bytes + 2].contiguous()
     vec_norm = norm_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
 
@@ -178,7 +176,6 @@ def _unpack_value(
     v_indices = v_indices.to(torch.float32)
 
     # Load scale and zero (fp16, 4 bytes total at val_data_bytes offset)
-    # Use view instead of << to avoid NPU __lshift__ segfault during graph replay
     sc_base = key_packed_size + val_data_bytes
     sc_bytes = slot_data[..., sc_base:sc_base + 2].contiguous()
     v_scale = sc_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
@@ -187,7 +184,6 @@ def _unpack_value(
     v_zero = zr_bytes.view(torch.uint16).view(torch.float16).to(torch.float32)
 
     # Dequantize: value = index * scale + zero
-    # v_scale/v_zero shape: (..., 1) — broadcasts over head_dim without unsqueeze
     value = v_indices * v_scale + v_zero
     return value.to(torch.float16)
 
@@ -208,74 +204,66 @@ def _gather_and_dequant_kv(
     norm_correction: bool,
     Pi: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather paged KV blocks and dequantize to FP16.
+    """Gather paged KV blocks and dequantize to FP16 (vectorized).
 
-    Args:
-        kv_cache: (num_blocks, block_size, Hk, slot_size) uint8 TQ cache.
-        block_table: (B, max_num_blocks) int32.
-        seq_lens: list of sequence lengths.
-        num_kv_heads: number of KV heads.
-        head_dim: attention head dimension.
-        (remaining args: TQ config parameters)
+    Builds flat indices for all valid tokens across sequences, gathers
+    from the flattened cache in a single operation, then batch-dequantizes
+    all keys and values simultaneously.
 
     Returns:
         key: (total_tokens, Hk, D) float16 dequantized keys.
         value: (total_tokens, Hk, D) float16 dequantized values.
     """
     block_size = kv_cache.shape[1]
+    slot_size = kv_cache.shape[3]
+    device = kv_cache.device
     B = len(seq_lens)
-    max_seq_len = max(seq_lens) if seq_lens else 0
-    max_blocks = block_table.shape[1]
 
-    all_keys = []
-    all_values = []
-
+    # Build flat indices for all valid tokens, preserving sequence order.
+    # Each index maps to (block_id * block_size + pos_in_block) in the
+    # flattened cache view.
+    index_parts = []
     for b in range(B):
-        seq_len = seq_lens[b]
-        if seq_len <= 0:
+        s = seq_lens[b]
+        if s <= 0:
             continue
+        n_blocks = (s + block_size - 1) // block_size
+        bids = block_table[b, :n_blocks]
+        positions = torch.arange(s, device=device)
+        flat_idx = bids[positions // block_size] * block_size + positions % block_size
+        index_parts.append(flat_idx)
 
-        # Gather blocks for this sequence
-        block_ids = block_table[b, : (seq_len + block_size - 1) // block_size]
-        gathered = kv_cache[block_ids]  # (n_blocks, block_size, Hk, slot_size)
-        # Flatten to (seq_len_padded, Hk, slot_size)
-        gathered = gathered.reshape(-1, num_kv_heads, kv_cache.shape[3])
-        gathered = gathered[:seq_len]  # (seq_len, Hk, slot_size)
-
-        # Dequantize key per head
-        k_list = []
-        v_list = []
-        for h in range(num_kv_heads):
-            slot_h = gathered[:, h, :]  # (seq_len, slot_size)
-
-            if key_fp8:
-                k = _unpack_fp8_key(slot_h, head_dim)
-            else:
-                k = _unpack_mse_key(
-                    slot_h, centroids, mse_bits, mse_bytes, head_dim, norm_correction
-                )
-
-            # Inverse Hadamard rotation for MSE keys: k_orig = k_recon @ Pi
-            if not key_fp8 and Pi is not None:
-                k = (k.float() @ Pi).to(torch.float16)
-
-            v = _unpack_value(slot_h, key_packed_size, value_quant_bits, val_data_bytes, head_dim)
-
-            k_list.append(k)
-            v_list.append(v)
-
-        # Stack heads: (seq_len, Hk, D)
-        keys_b = torch.stack(k_list, dim=1)
-        values_b = torch.stack(v_list, dim=1)
-        all_keys.append(keys_b)
-        all_values.append(values_b)
-
-    if not all_keys:
-        empty = torch.zeros(0, num_kv_heads, head_dim, dtype=torch.float16, device=kv_cache.device)
+    if not index_parts:
+        empty = torch.zeros(0, num_kv_heads, head_dim, dtype=torch.float16, device=device)
         return empty, empty
 
-    key = torch.cat(all_keys, dim=0)
-    value = torch.cat(all_values, dim=0)
+    all_indices = torch.cat(index_parts)  # (total_tokens,)
+
+    # Gather from flattened cache: (total_tokens, Hk, slot_size)
+    kv_flat = kv_cache.reshape(-1, num_kv_heads, slot_size)
+    valid_data = kv_flat[all_indices]
+
+    # Flatten to (total_tokens * Hk, slot_size) for batch unpacking
+    flat_data = valid_data.reshape(-1, slot_size)
+
+    # Vectorized key dequantization
+    if key_fp8:
+        all_keys = _unpack_fp8_key(flat_data, head_dim)
+    else:
+        all_keys = _unpack_mse_key(
+            flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction
+        )
+        if Pi is not None:
+            all_keys = (all_keys.float() @ Pi).to(torch.float16)
+
+    # Vectorized value dequantization
+    all_values = _unpack_value(
+        flat_data, key_packed_size, value_quant_bits, val_data_bytes, head_dim
+    )
+
+    # Reshape to (total_tokens, Hk, D)
+    key = all_keys.reshape(-1, num_kv_heads, head_dim)
+    value = all_values.reshape(-1, num_kv_heads, head_dim)
     return key, value
 
 
@@ -298,16 +286,11 @@ def npu_turboquant_decode_attention(
     norm_correction: bool,
     Pi: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Decode attention for TurboQuant on NPU.
+    """Decode attention for TurboQuant on NPU (vectorized).
 
-    Strategy: dequantize KV from compressed cache into a temporary
-    paged FP16 cache, then call npu_fused_infer_attention_score with
-    block_table (paged attention).  This matches the pattern used by
-    the standard AscendAttention backend for decode.
-
-    NPU FIA non-paged mode does NOT support different Q/KV lengths,
-    which is required for decode (1 query token vs many KV tokens).
-    Paged attention with block_table is the only working decode path.
+    Gathers all used cache blocks in a single tensor, batch-dequantizes
+    all keys and values, then runs paged attention via
+    npu_fused_infer_attention_score.
 
     Returns:
         output: (num_decode_tokens, Hq, D) float16.
@@ -315,6 +298,7 @@ def npu_turboquant_decode_attention(
     B = block_table.shape[0]
     D = head_dim
     block_size = kv_cache.shape[1]
+    slot_size = kv_cache.shape[3]
     device = query.device
 
     mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
@@ -335,46 +319,41 @@ def npu_turboquant_decode_attention(
     used_blocks = torch.unique(torch.cat(active_ids))
     n_used = used_blocks.shape[0]
 
+    # Gather all used blocks at once: (n_used, block_size, Hk, slot_size)
+    all_block_data = kv_cache[used_blocks]
+
+    # Flatten to (n_used * block_size * Hk, slot_size) for batch unpacking
+    flat_data = all_block_data.reshape(-1, slot_size)
+
+    # Vectorized key dequantization
+    if key_fp8:
+        all_keys = _unpack_fp8_key(flat_data, D)
+    else:
+        all_keys = _unpack_mse_key(
+            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction
+        )
+        if Pi is not None:
+            all_keys = (all_keys.float() @ Pi).to(torch.float16)
+
+    # Vectorized value dequantization
+    all_values = _unpack_value(
+        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D
+    )
+
+    # Reshape to paged FP16 cache format: (n_used, block_size, Hk * D)
+    key_cache_fp16 = all_keys.reshape(n_used, block_size, num_kv_heads * D)
+    value_cache_fp16 = all_values.reshape(n_used, block_size, num_kv_heads * D)
+
     # Build reverse mapping: original block_id -> index in partial cache
     max_id = used_blocks.max().item()
     id_to_idx = torch.full((max_id + 1,), -1, dtype=torch.int32, device=device)
-    for i in range(n_used):
-        id_to_idx[used_blocks[i].item()] = i
-
-    # Dequantize used blocks into paged FP16 format:
-    #   (n_used, block_size, num_kv_heads * head_dim) — flattened heads,
-    #   same layout as standard AscendAttention key_cache.
-    key_cache_fp16 = query.new_empty(n_used, block_size, num_kv_heads * D)
-    value_cache_fp16 = query.new_empty(n_used, block_size, num_kv_heads * D)
-
-    for i in range(n_used):
-        bid = used_blocks[i].item()
-        block_data = kv_cache[bid]  # (block_size, Hk, slot_size)
-
-        for h in range(num_kv_heads):
-            slot_h = block_data[:, h, :]  # (block_size, slot_size)
-
-            if key_fp8:
-                k = _unpack_fp8_key(slot_h, D)
-            else:
-                k = _unpack_mse_key(
-                    slot_h, centroids, mse_bits, mse_bytes, D, norm_correction
-                )
-                if Pi is not None:
-                    k = (k.float() @ Pi).to(torch.float16)
-
-            v = _unpack_value(
-                slot_h, key_packed_size, value_quant_bits, val_data_bytes, D
-            )
-
-            key_cache_fp16[i, :, h * D : (h + 1) * D] = k
-            value_cache_fp16[i, :, h * D : (h + 1) * D] = v
+    id_to_idx[used_blocks] = torch.arange(n_used, dtype=torch.int32, device=device)
 
     # Remap block_table: original block IDs -> partial cache indices
     bt_clamped = block_table.clamp(min=0, max=max_id)
     remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
 
-    # Paged attention via FIA — same pattern as standard AscendAttention
+    # Paged attention via FIA
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query[:B],
         key_cache_fp16,
