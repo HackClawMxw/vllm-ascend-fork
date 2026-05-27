@@ -336,6 +336,31 @@ def npu_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     device = query.device
 
+    # ---- TQ DIAGNOSTIC: check if kv_cache has any data ----
+    if not _diag_decode_done:
+        # Scan all blocks for non-zero data
+        total_nonzero = (kv_cache.float() != 0).sum().item()
+        total_el = kv_cache.numel()
+        # Check which blocks have any non-zero data
+        block_nonzero = (kv_cache.float() != 0).sum(dim=(1, 2, 3))
+        nonzero_blocks = (block_nonzero > 0).nonzero(as_tuple=True)[0]
+        print(f"[TQ-DIAG-CACHE] kv_cache shape={kv_cache.shape} dtype={kv_cache.dtype} "
+              f"nonzero={total_nonzero}/{total_el} "
+              f"blocks_with_data={nonzero_blocks[:8].tolist()}")
+        # Check block_table vs actual blocks with data
+        for b in range(min(B, 2)):
+            sl = seq_lens[b] if b < len(seq_lens) else 0
+            if sl <= 0:
+                continue
+            nb = (sl + block_size - 1) // block_size
+            bt_blocks = block_table[b, :nb].tolist()
+            print(f"[TQ-DIAG-CACHE] seq={b} seq_len={sl} n_blocks={nb} "
+                  f"block_table={bt_blocks}")
+            for bid in bt_blocks[:4]:
+                b_nz = block_nonzero[bid].item()
+                print(f"[TQ-DIAG-CACHE]   block[{bid}] nonzero_elements={b_nz}")
+    # ---- END TQ DIAGNOSTIC ----
+
     mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
     val_data_bytes = math.ceil(D * value_quant_bits / 8)
 
