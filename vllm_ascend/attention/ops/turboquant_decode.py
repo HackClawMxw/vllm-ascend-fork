@@ -336,8 +336,12 @@ def npu_turboquant_decode_attention(
     block_size = kv_cache.shape[1]
     device = query.device
 
-    # ---- TQ DIAGNOSTIC: check if kv_cache has any data ----
-    if not _diag_decode_done:
+    # ---- TQ DIAGNOSTIC (global must precede any use) ----
+    global _diag_decode_done
+    _do_diag = not _diag_decode_done
+
+    # Check if kv_cache has any data at all
+    if _do_diag:
         # Scan all blocks for non-zero data
         total_nonzero = (kv_cache.float() != 0).sum().item()
         total_el = kv_cache.numel()
@@ -427,8 +431,6 @@ def npu_turboquant_decode_attention(
     remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
 
     # ---- TQ DIAGNOSTIC: decode pre-FIA check ----
-    global _diag_decode_done
-    _do_diag = not _diag_decode_done
     if _do_diag:
         kcf = key_cache_fp16.float()
         vcf = value_cache_fp16.float()
