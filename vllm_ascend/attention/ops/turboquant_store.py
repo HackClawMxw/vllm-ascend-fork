@@ -17,6 +17,9 @@ import math
 
 import torch
 
+# Module-level flag for one-shot scatter diagnostic
+_diag_scatter_done = False
+
 
 def _quantize_values_batched(
     values: torch.Tensor,
@@ -104,6 +107,28 @@ def _scatter_to_cache(
     pos_indices = valid_slots % block_size
 
     kv_cache[block_indices, pos_indices, valid_heads] = valid_data
+
+    # ---- TQ DIAGNOSTIC: verify scatter write ----
+    global _diag_scatter_done
+    if not _diag_scatter_done:
+        _diag_scatter_done = True
+        # Verify write by reading back the first written position
+        if valid_slots.numel() > 0:
+            first_slot = valid_slots[0].item()
+            first_head = valid_heads[0].item()
+            first_block = first_slot // block_size
+            first_pos = first_slot % block_size
+            readback = kv_cache[first_block, first_pos, first_head, :]
+            wrote = valid_data[0, :]
+            match = (readback == wrote).all().item()
+            print(f"[TQ-DIAG-SCATTER] slot={first_slot} block={first_block} "
+                  f"pos={first_pos} head={first_head} match={match}")
+            print(f"[TQ-DIAG-SCATTER] wrote[:16]={wrote[:16].tolist()}")
+            print(f"[TQ-DIAG-SCATTER] read[:16]={readback[:16].tolist()}")
+            print(f"[TQ-DIAG-SCATTER] n_valid={valid_slots.numel()} "
+                  f"block_indices[:4]={block_indices[:4].tolist()} "
+                  f"pos_indices[:4]={pos_indices[:4].tolist()}")
+    # ---- END TQ DIAGNOSTIC ----
 
 
 def _store_fp8_key_value(

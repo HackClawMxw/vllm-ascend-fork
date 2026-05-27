@@ -38,6 +38,9 @@ from vllm_ascend.attention.ops.turboquant_decode import (
 )
 from vllm_ascend.attention.ops.turboquant_store import npu_turboquant_store
 
+# Module-level diagnostic flag (survives graph capture warmup)
+_diag_store_roundtrip_done = [False]
+
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
     """Orthonormal Hadamard matrix (Sylvester construction), cached per (d, device)."""
@@ -268,8 +271,10 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         self._store_kv(k, v, kv_cache, slot_mapping, layer)
 
         # ---- TQ DIAGNOSTIC: store round-trip verification ----
-        if not getattr(self, '_tq_diag_store_done', False):
-            self._tq_diag_store_done = True
+        # Use module-level flag to survive graph capture warmup.
+        # Only run for real prefill (N > 1), skip graph capture dummy calls (N=1).
+        if N > 1 and not _diag_store_roundtrip_done:
+            _diag_store_roundtrip_done[0] = True  # type: ignore
             self._diag_store_roundtrip(
                 k, v, kv_cache, slot_mapping, layer, N,
             )
