@@ -59,7 +59,7 @@ class AscendTurboQuantBackend(AttentionBackend):
     """TurboQuant attention backend for Ascend NPU."""
 
     accept_output_buffer: bool = True
-    forward_includes_kv_cache_update: bool = False
+    forward_includes_kv_cache_update: bool = True
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
@@ -316,6 +316,13 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         q = query[:N].view(N, self.num_heads, self.head_size)
 
         self._ensure_on_device(layer, q.device)
+
+        # Store compressed K/V into cache (inside forward to work with
+        # torch.compile — matching standard AscendAttention pattern).
+        k = key[:N].view(N, self.num_kv_heads, self.head_size)
+        v = value[:N].view(N, self.num_kv_heads, self.head_size)
+        self._store_kv(k, v, kv_cache, attn_metadata.slot_mapping, layer)
+
         Pi = layer._tq_Pi
         PiT = layer._tq_PiT
         centroids = layer._tq_centroids
@@ -328,8 +335,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                 q, kv_cache, attn_metadata, centroids, Pi
             )
         elif num_decodes == 0:
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
             attn_out = self._prefill_attention(
                 q, k, v, kv_cache, attn_metadata, centroids, Pi, layer
             )
@@ -367,8 +372,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
             )
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
             attn_out[num_decode_tokens:] = self._prefill_attention(
                 q[num_decode_tokens:],
                 k[num_decode_tokens:],
