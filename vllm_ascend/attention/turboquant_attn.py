@@ -308,7 +308,7 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         # torch.compile — matching standard AscendAttention pattern).
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
-        self._store_kv(k, v, kv_cache, attn_metadata.slot_mapping, layer)
+        self._store_kv(k, v, kv_cache, attn_metadata.slot_mapping[:N], layer)
 
         Pi = layer._tq_Pi
         PiT = layer._tq_PiT
