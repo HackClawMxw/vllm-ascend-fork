@@ -389,42 +389,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
         )
-        self._update_shadow_cache(key, value, slot_mapping, kv_cache)
-
-    def _update_shadow_cache(self, key, value, slot_mapping, kv_cache):
-        """Scatter raw KV into a shadow FP16/BF16 paged cache for fast decode.
-
-        The shadow cache is in the standard paged format used by
-        npu_fused_infer_attention_score, so decode can skip dequantization
-        entirely and call FIA directly.
-        """
-        N = slot_mapping.shape[0]
-        if N <= 0:
-            return
-
-        if not hasattr(self, '_shadow_key'):
-            num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
-            cache_shape = (num_blocks, block_size,
-                           self.num_kv_heads * self.head_size)
-            self._shadow_key = torch.zeros(
-                *cache_shape, dtype=key.dtype, device=key.device)
-            self._shadow_value = torch.zeros(
-                *cache_shape, dtype=key.dtype, device=key.device)
-
-        block_size = kv_cache.shape[1]
-        D = self.head_size
-        Hk = self.num_kv_heads
-
-        k_flat = key[:N].reshape(N, Hk * D)
-        v_flat = value[:N].reshape(N, Hk * D)
-
-        valid = slot_mapping[:N] >= 0
-        slots = slot_mapping[:N][valid]
-        block_idx = slots // block_size
-        pos_idx = slots % block_size
-
-        self._shadow_key[block_idx, pos_idx] = k_flat[valid]
-        self._shadow_value[block_idx, pos_idx] = v_flat[valid]
 
     # ------------------------------------------------------------------ #
     #  Prefill attention                                                   #
@@ -540,27 +504,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
     #  Decode attention                                                    #
     # ------------------------------------------------------------------ #
     def _decode_attention(self, q, kv_cache, attn_metadata, centroids, Pi):
-        # Fast path: use shadow cache directly with FIA — no dequantization.
-        if hasattr(self, '_shadow_key'):
-            B = attn_metadata.block_table.shape[0]
-            block_size = kv_cache.shape[1]
-            output, _ = torch_npu.npu_fused_infer_attention_score(
-                q[:B],
-                self._shadow_key,
-                self._shadow_value,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                scale=self.scale,
-                input_layout="TND",
-                block_table=attn_metadata.block_table,
-                block_size=block_size,
-                sparse_mode=0,
-                actual_seq_lengths=[1] * B,
-                actual_seq_lengths_kv=attn_metadata.seq_lens.tolist(),
-            )
-            return output
-
-        # Fallback: dequantize from TQ cache (only if shadow not initialized)
         return npu_turboquant_decode_attention(
             query=q,
             kv_cache=kv_cache,
@@ -579,4 +522,5 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             centroids=centroids,
             norm_correction=self.tq_config.norm_correction,
             Pi=Pi,
+            target_dtype=q.dtype,
         )

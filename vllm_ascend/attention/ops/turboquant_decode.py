@@ -255,7 +255,7 @@ def _gather_and_dequant_kv(
             flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction
         )
         if Pi is not None:
-            all_keys = (all_keys.float() @ Pi).to(torch.float16)
+            all_keys = all_keys.to(target_dtype) @ Pi.to(target_dtype)
 
     # Vectorized value dequantization
     all_values = _unpack_value(
@@ -286,6 +286,7 @@ def npu_turboquant_decode_attention(
     centroids: torch.Tensor,
     norm_correction: bool,
     Pi: torch.Tensor | None,
+    target_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """Decode attention for TurboQuant on NPU (vectorized).
 
@@ -294,7 +295,7 @@ def npu_turboquant_decode_attention(
     npu_fused_infer_attention_score.
 
     Returns:
-        output: (num_decode_tokens, Hq, D) float16.
+        output: (num_decode_tokens, Hq, D) in target_dtype.
     """
     B = block_table.shape[0]
     D = head_dim
@@ -334,7 +335,7 @@ def npu_turboquant_decode_attention(
             flat_data, centroids, mse_bits, mse_bytes, D, norm_correction
         )
         if Pi is not None:
-            all_keys = (all_keys.float() @ Pi).to(torch.float16)
+            all_keys = all_keys.to(target_dtype) @ Pi.to(target_dtype)
 
     # Vectorized value dequantization
     all_values = _unpack_value(
@@ -342,13 +343,8 @@ def npu_turboquant_decode_attention(
     )
 
     # Reshape to paged cache format: (n_used, block_size, Hk * D)
-    key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D)
-    value_cache = all_values.reshape(n_used, block_size, num_kv_heads * D)
-
-    # FIA requires query/key/value to share the same dtype
-    target_dtype = query.dtype
-    key_cache = key_cache.to(target_dtype)
-    value_cache = value_cache.to(target_dtype)
+    key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
+    value_cache = all_values.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
 
     # Build reverse mapping: original block_id -> index in partial cache
     max_id = used_blocks.max().item()
