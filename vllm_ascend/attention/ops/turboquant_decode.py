@@ -202,7 +202,6 @@ def _gather_and_dequant_kv(
     val_data_bytes: int,
     centroids: torch.Tensor,
     norm_correction: bool,
-    Pi: torch.Tensor | None,
     target_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather paged KV blocks and dequantize (vectorized).
@@ -211,9 +210,13 @@ def _gather_and_dequant_kv(
     from the flattened cache in a single operation, then batch-dequantizes
     all keys and values simultaneously.
 
+    Keys are returned in Hadamard-rotated space (matching the compressed
+    cache format). The caller is responsible for rotating Q (and any
+    current-batch K) into the same space before calling attention.
+
     Returns:
-        key: (total_tokens, Hk, D) float16 dequantized keys.
-        value: (total_tokens, Hk, D) float16 dequantized values.
+        key: (total_tokens, Hk, D) dequantized keys (Hadamard space).
+        value: (total_tokens, Hk, D) dequantized values.
     """
     block_size = kv_cache.shape[1]
     slot_size = kv_cache.shape[3]
@@ -254,8 +257,6 @@ def _gather_and_dequant_kv(
         all_keys = _unpack_mse_key(
             flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction
         )
-        if Pi is not None:
-            all_keys = all_keys.to(target_dtype) @ Pi.to(target_dtype)
 
     # Vectorized value dequantization
     all_values = _unpack_value(
@@ -285,7 +286,6 @@ def npu_turboquant_decode_attention(
     num_heads: int,
     centroids: torch.Tensor,
     norm_correction: bool,
-    Pi: torch.Tensor | None,
     target_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """Decode attention for TurboQuant on NPU (vectorized).
@@ -293,6 +293,9 @@ def npu_turboquant_decode_attention(
     Gathers all used cache blocks in a single tensor, batch-dequantizes
     all keys and values, then runs paged attention via
     npu_fused_infer_attention_score.
+
+    Keys are dequantized in Hadamard-rotated space. The caller must
+    pre-rotate the query via ``query = query @ Pi`` before calling.
 
     Returns:
         output: (num_decode_tokens, Hq, D) in target_dtype.
@@ -334,8 +337,6 @@ def npu_turboquant_decode_attention(
         all_keys = _unpack_mse_key(
             flat_data, centroids, mse_bits, mse_bytes, D, norm_correction
         )
-        if Pi is not None:
-            all_keys = all_keys.to(target_dtype) @ Pi.to(target_dtype)
 
     # Vectorized value dequantization
     all_values = _unpack_value(
@@ -391,15 +392,15 @@ def npu_turboquant_full_dequant_kv(
     val_data_bytes: int,
     centroids: torch.Tensor,
     norm_correction: bool,
-    Pi: torch.Tensor | None,
     target_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full dequantization of all cached KV for continuation prefill.
 
-    Returns per-request batched K, V tensors for use with flash attention.
+    Keys are returned in Hadamard-rotated space. The caller must rotate
+    Q and current-batch K into the same space before calling attention.
 
     Returns:
-        key: (total_tokens, Hk, D) in target_dtype.
+        key: (total_tokens, Hk, D) in target_dtype (Hadamard space).
         value: (total_tokens, Hk, D) in target_dtype.
     """
     mse_bytes = math.ceil(head_dim * mse_bits / 8) if not key_fp8 else 0
@@ -409,5 +410,5 @@ def npu_turboquant_full_dequant_kv(
         num_kv_heads, head_dim,
         key_fp8, mse_bits, mse_bytes,
         key_packed_size, value_quant_bits, val_data_bytes,
-        centroids, norm_correction, Pi, target_dtype,
+        centroids, norm_correction, target_dtype,
     )

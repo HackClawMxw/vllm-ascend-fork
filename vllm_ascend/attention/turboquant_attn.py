@@ -401,12 +401,17 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         if attn_metadata.max_query_len == attn_metadata.max_seq_len:
             return self._flash_attn_varlen(q, k, v, attn_metadata)
 
-        # Continuation prefill: need to attend to previously cached KV
+        # Continuation prefill: need to attend to previously cached KV.
+        # Rotate Q and current-batch K into Hadamard space so they match
+        # the dequantized cached keys (which are returned in Hadamard space).
+        q = q @ Pi.to(q.dtype)
+        k = k @ Pi.to(k.dtype)
+
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
         query_start_loc = attn_metadata.query_start_loc
 
-        # Dequantize all cached KV
+        # Dequantize all cached KV (keys in Hadamard space)
         key_dequant, value_dequant = npu_turboquant_full_dequant_kv(
             kv_cache, block_table, seq_lens.tolist(),
             self.num_kv_heads, D,
@@ -417,7 +422,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             self._val_data_bytes,
             centroids,
             self.tq_config.norm_correction,
-            Pi,
             target_dtype=q.dtype,
         )
 
@@ -504,8 +508,11 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
     #  Decode attention                                                    #
     # ------------------------------------------------------------------ #
     def _decode_attention(self, q, kv_cache, attn_metadata, centroids, Pi):
+        # Rotate query into Hadamard space (matching compressed key space).
+        # This avoids the expensive inverse-rotation on all dequantized keys.
+        q_rot = q @ Pi.to(q.dtype)
         return npu_turboquant_decode_attention(
-            query=q,
+            query=q_rot,
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens.tolist(),
@@ -521,6 +528,5 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             num_heads=self.num_heads,
             centroids=centroids,
             norm_correction=self.tq_config.norm_correction,
-            Pi=Pi,
             target_dtype=q.dtype,
         )
