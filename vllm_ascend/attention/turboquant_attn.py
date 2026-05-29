@@ -241,6 +241,18 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             c_sorted, _ = c.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
+
+            # Precompute 4-bit LUTs for fast dequantization (reduces kernel
+            # launches from ~7 to ~2 per unpack).  Each byte encodes two 4-bit
+            # indices; the LUT maps byte → [centroid[lo], centroid[hi]].
+            byte_vals = torch.arange(256, dtype=torch.int64, device=device)
+            lo = byte_vals & 0xF
+            hi = (byte_vals >> 4) & 0xF
+            layer._tq_key_lut = torch.stack([c[lo], c[hi]], dim=-1)   # (256, 2) f32
+            layer._tq_val_idx_lut = torch.stack([                       # (256, 2) f32
+                lo.float(), hi.float()
+            ], dim=-1)
+
             layer._tq_cached = True
 
     def do_kv_cache_update(
@@ -313,17 +325,20 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
         Pi = layer._tq_Pi
         PiT = layer._tq_PiT
         centroids = layer._tq_centroids
+        key_lut = getattr(layer, '_tq_key_lut', None)
+        val_idx_lut = getattr(layer, '_tq_val_idx_lut', None)
 
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if not attn_metadata.is_prefill:
             attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, centroids, Pi
+                q, kv_cache, attn_metadata, centroids, Pi, key_lut, val_idx_lut
             )
         elif num_decodes == 0:
             attn_out = self._prefill_attention(
-                q, k, v, kv_cache, attn_metadata, centroids, Pi, layer
+                q, k, v, kv_cache, attn_metadata, centroids, Pi, layer,
+                key_lut, val_idx_lut,
             )
         else:
             # Mixed batch: decodes first (guaranteed by reorder_batch_threshold)
@@ -343,7 +358,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                 is_prefill=False,
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, centroids, Pi
+                q[:num_decode_tokens], kv_cache, decode_meta, centroids, Pi,
+                key_lut, val_idx_lut,
             )
 
             prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
@@ -368,6 +384,7 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
                 centroids,
                 Pi,
                 layer,
+                key_lut, val_idx_lut,
             )
 
         if output.ndim == 3:
@@ -394,7 +411,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
     #  Prefill attention                                                   #
     # ------------------------------------------------------------------ #
     def _prefill_attention(self, q, k, v, kv_cache, attn_metadata,
-                           centroids, Pi, layer):
+                           centroids, Pi, layer,
+                           key_lut=None, val_idx_lut=None):
         N, Hq, D = q.shape
 
         # First-chunk prefill: all K/V are in the current batch, no cached KV
@@ -423,6 +441,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             centroids,
             self.tq_config.norm_correction,
             target_dtype=q.dtype,
+            key_lut=key_lut,
+            val_idx_lut=val_idx_lut,
         )
 
         # Concatenate dequantized cached KV with current batch KV
@@ -507,7 +527,8 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
     # ------------------------------------------------------------------ #
     #  Decode attention                                                    #
     # ------------------------------------------------------------------ #
-    def _decode_attention(self, q, kv_cache, attn_metadata, centroids, Pi):
+    def _decode_attention(self, q, kv_cache, attn_metadata, centroids, Pi,
+                          key_lut=None, val_idx_lut=None):
         # Rotate query into Hadamard space (matching compressed key space).
         # This avoids the expensive inverse-rotation on all dequantized keys.
         q_rot = q @ Pi.to(q.dtype)
@@ -529,4 +550,6 @@ class AscendTurboQuantImpl(AttentionImpl[AscendTurboQuantMetadata]):
             centroids=centroids,
             norm_correction=self.tq_config.norm_correction,
             target_dtype=q.dtype,
+            key_lut=key_lut,
+            val_idx_lut=val_idx_lut,
         )

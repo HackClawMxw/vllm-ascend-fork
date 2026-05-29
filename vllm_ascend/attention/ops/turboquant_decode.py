@@ -25,6 +25,7 @@ def _unpack_mse_key(
     mse_bytes: int,
     head_dim: int,
     norm_correction: bool = False,
+    key_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unpack MSE key indices and reconstruct key vector.
 
@@ -35,34 +36,40 @@ def _unpack_mse_key(
         mse_bytes: bytes for packed MSE indices.
         head_dim: attention head dimension.
         norm_correction: whether to normalize centroid vectors.
+        key_lut: (256, 2) float32 precomputed LUT for 4-bit mode.
+            Maps byte → [centroid[lo], centroid[hi]], avoiding 5+ kernel
+            launches for bit-unpack + centroid gather.
 
     Returns:
         key: (..., head_dim) float16 reconstructed key.
     """
     n_centroids = 1 << mse_bits
 
-    # Unpack bit-packed indices
-    mse_raw = slot_data[..., :mse_bytes].to(torch.int32)
-
-    if mse_bits == 4:
-        # Two 4-bit indices per byte
+    # Fast path: 4-bit LUT (2 kernels instead of 7 for bit-unpack + gather)
+    if mse_bits == 4 and key_lut is not None:
+        byte_data = slot_data[..., :mse_bytes].long()
+        key_pairs = key_lut[byte_data]                      # (..., 64, 2) f32
+        key = key_pairs.reshape(*slot_data.shape[:-1], head_dim)  # (..., 128) f32
+    elif mse_bits == 4:
+        # Fallback without LUT
+        mse_raw = slot_data[..., :mse_bytes].to(torch.int32)
         idx_lo = mse_raw & 0xF
         idx_hi = (mse_raw >> 4) & 0xF
         indices = torch.stack([idx_lo, idx_hi], dim=-1).reshape(
             *mse_raw.shape[:-1], head_dim
         )
+        indices = indices.clamp(0, n_centroids - 1)
+        key = centroids[indices]
     elif mse_bits == 3:
         # Eight 3-bit indices per 3 bytes
         n_groups = head_dim // 8
         raw = slot_data[..., : n_groups * 3].to(torch.int32)
-        # Read 2 bytes per group for 16-bit window
         raw_16 = torch.zeros(*raw.shape[:-1], n_groups, 4, dtype=torch.int32, device=raw.device)
         for g in range(n_groups):
             raw_16[..., g, 0] = raw[..., g * 3]
             raw_16[..., g, 1] = raw[..., g * 3 + 1]
             raw_16[..., g, 2] = raw[..., g * 3 + 2]
 
-        # For each of the 8 indices in a group
         indices_list = []
         for b in range(8):
             byte_idx = (b * 3) // 8
@@ -76,13 +83,10 @@ def _unpack_mse_key(
         indices = torch.stack(indices_list, dim=-1).reshape(
             *slot_data.shape[:-1], head_dim
         )
+        indices = indices.clamp(0, n_centroids - 1)
+        key = centroids[indices]
     else:
         raise ValueError(f"Unsupported mse_bits: {mse_bits}")
-
-    indices = indices.clamp(0, n_centroids - 1)
-
-    # Gather centroids
-    key = centroids[indices]
 
     # Norm correction: re-normalize centroid vector to unit norm
     if norm_correction:
@@ -123,6 +127,7 @@ def _unpack_value(
     value_quant_bits: int,
     val_data_bytes: int,
     head_dim: int,
+    val_idx_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unpack quantized value from slot data.
 
@@ -132,20 +137,27 @@ def _unpack_value(
         value_quant_bits: 3 or 4 bits.
         val_data_bytes: bytes for packed value data.
         head_dim: attention head dimension.
+        val_idx_lut: (256, 2) float32 precomputed LUT for 4-bit mode.
+            Maps byte → [float(lo), float(hi)], avoiding 5+ kernel launches.
 
     Returns:
         value: (..., head_dim) float16 reconstructed value.
     """
-    val_raw = slot_data[..., key_packed_size : key_packed_size + val_data_bytes].to(
-        torch.int32
-    )
-
-    if value_quant_bits == 4:
+    # Fast path: 4-bit LUT (2 kernels instead of 7)
+    if value_quant_bits == 4 and val_idx_lut is not None:
+        byte_data = slot_data[..., key_packed_size : key_packed_size + val_data_bytes].long()
+        v_pairs = val_idx_lut[byte_data]                           # (..., 64, 2) f32
+        v_indices = v_pairs.reshape(*slot_data.shape[:-1], head_dim)  # (..., 128) f32
+    elif value_quant_bits == 4:
+        val_raw = slot_data[..., key_packed_size : key_packed_size + val_data_bytes].to(
+            torch.int32
+        )
         idx_lo = val_raw & 0xF
         idx_hi = (val_raw >> 4) & 0xF
         v_indices = torch.stack([idx_lo, idx_hi], dim=-1).reshape(
             *val_raw.shape[:-1], head_dim
         )
+        v_indices = v_indices.to(torch.float32)
     elif value_quant_bits == 3:
         n_groups = head_dim // 8
         raw = slot_data[..., key_packed_size : key_packed_size + n_groups * 3].to(
@@ -170,10 +182,9 @@ def _unpack_value(
         v_indices = torch.stack(indices_list, dim=-1).reshape(
             *slot_data.shape[:-1], head_dim
         )
+        v_indices = v_indices.to(torch.float32)
     else:
         raise ValueError(f"Unsupported value_quant_bits: {value_quant_bits}")
-
-    v_indices = v_indices.to(torch.float32)
 
     # Load scale and zero (fp16, 4 bytes total at val_data_bytes offset)
     sc_base = key_packed_size + val_data_bytes
@@ -203,6 +214,8 @@ def _gather_and_dequant_kv(
     centroids: torch.Tensor,
     norm_correction: bool,
     target_dtype: torch.dtype = torch.float16,
+    key_lut: torch.Tensor | None = None,
+    val_idx_lut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather paged KV blocks and dequantize (vectorized).
 
@@ -255,12 +268,14 @@ def _gather_and_dequant_kv(
         all_keys = _unpack_fp8_key(flat_data, head_dim)
     else:
         all_keys = _unpack_mse_key(
-            flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction
+            flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction,
+            key_lut=key_lut,
         )
 
     # Vectorized value dequantization
     all_values = _unpack_value(
-        flat_data, key_packed_size, value_quant_bits, val_data_bytes, head_dim
+        flat_data, key_packed_size, value_quant_bits, val_data_bytes, head_dim,
+        val_idx_lut=val_idx_lut,
     )
 
     # Reshape to (total_tokens, Hk, D) and cast to target dtype
@@ -287,6 +302,8 @@ def npu_turboquant_decode_attention(
     centroids: torch.Tensor,
     norm_correction: bool,
     target_dtype: torch.dtype = torch.float16,
+    key_lut: torch.Tensor | None = None,
+    val_idx_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode attention for TurboQuant on NPU (vectorized).
 
@@ -335,12 +352,14 @@ def npu_turboquant_decode_attention(
         all_keys = _unpack_fp8_key(flat_data, D)
     else:
         all_keys = _unpack_mse_key(
-            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction
+            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction,
+            key_lut=key_lut,
         )
 
     # Vectorized value dequantization
     all_values = _unpack_value(
-        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D
+        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D,
+        val_idx_lut=val_idx_lut,
     )
 
     # Reshape to paged cache format: (n_used, block_size, Hk * D)
@@ -393,6 +412,8 @@ def npu_turboquant_full_dequant_kv(
     centroids: torch.Tensor,
     norm_correction: bool,
     target_dtype: torch.dtype = torch.float16,
+    key_lut: torch.Tensor | None = None,
+    val_idx_lut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full dequantization of all cached KV for continuation prefill.
 
@@ -411,4 +432,5 @@ def npu_turboquant_full_dequant_kv(
         key_fp8, mse_bits, mse_bytes,
         key_packed_size, value_quant_bits, val_data_bytes,
         centroids, norm_correction, target_dtype,
+        key_lut=key_lut, val_idx_lut=val_idx_lut,
     )
