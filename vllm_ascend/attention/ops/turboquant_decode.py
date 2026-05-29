@@ -356,6 +356,14 @@ def npu_turboquant_decode_attention(
     remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
 
     # Paged attention via FIA
+    # TND + block_table requires cumulative sequence lengths
+    cum_seq_lens_q = list(range(1, B + 1))
+    cum_seq_lens_kv = []
+    total = 0
+    for s in seq_lens:
+        total += s
+        cum_seq_lens_kv.append(total)
+
     output, _ = torch_npu.npu_fused_infer_attention_score(
         query[:B],
         key_cache,
@@ -367,8 +375,8 @@ def npu_turboquant_decode_attention(
         block_table=remapped_bt,
         block_size=block_size,
         sparse_mode=0,
-        actual_seq_lengths=[1] * B,
-        actual_seq_lengths_kv=seq_lens,
+        actual_seq_lengths=cum_seq_lens_q,
+        actual_seq_lengths_kv=cum_seq_lens_kv,
     )
 
     return output
