@@ -17,6 +17,80 @@ import math
 import torch
 import torch_npu
 
+# Precompute a uint16→float32 LUT to replace .view() bitcast chains
+# that torch.compile cannot fuse.  65536 × 4 B = 256 KiB, negligible.
+_fp16_decode_lut: torch.Tensor | None = None
+
+
+def _get_fp16_lut(device: torch.device) -> torch.Tensor:
+    global _fp16_decode_lut
+    if _fp16_decode_lut is None or _fp16_decode_lut.device != device:
+        all_u16 = torch.arange(65536, dtype=torch.int32, device=device)
+        _fp16_decode_lut = (
+            all_u16.to(torch.int16).view(torch.float16).to(torch.float32)
+        )
+    return _fp16_decode_lut
+
+
+def _compiled_dequant_kv_4bit(
+    slot_data: torch.Tensor,
+    key_lut: torch.Tensor,
+    val_idx_lut: torch.Tensor,
+    fp16_lut: torch.Tensor,
+    mse_bytes: int,
+    head_dim: int,
+    key_packed_size: int,
+    val_data_bytes: int,
+    norm_correction: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused 4-bit key + value dequantization for torch.compile.
+
+    Combines the entire key and value dequantization pipeline into a
+    single compilable region, enabling the backend to fuse operations
+    and reduce kernel launches from ~30 to as few as 1-2.
+    """
+    N = slot_data.shape[0]
+
+    # ---- Key dequant (LUT) ----
+    k_bytes = slot_data[..., :mse_bytes].long()
+    key = key_lut[k_bytes].reshape(N, head_dim)
+
+    if norm_correction:
+        c_norm_sq = (key * key).sum(dim=-1, keepdim=True)
+        key = key / torch.sqrt(c_norm_sq + 1e-16)
+
+    # Vec norm via LUT (avoids .view() bitcast that blocks compile fusion)
+    n_lo = slot_data[..., mse_bytes].to(torch.int32)
+    n_hi = slot_data[..., mse_bytes + 1].to(torch.int32)
+    vec_norm = fp16_lut[(n_lo | (n_hi << 8))]
+    key = vec_norm * key
+
+    # ---- Value dequant (LUT) ----
+    v_bytes = slot_data[..., key_packed_size:key_packed_size + val_data_bytes].long()
+    v_indices = val_idx_lut[v_bytes].reshape(N, head_dim)
+
+    sc_base = key_packed_size + val_data_bytes
+    s_lo = slot_data[..., sc_base].to(torch.int32)
+    s_hi = slot_data[..., sc_base + 1].to(torch.int32)
+    v_scale = fp16_lut[(s_lo | (s_hi << 8))]
+
+    z_lo = slot_data[..., sc_base + 2].to(torch.int32)
+    z_hi = slot_data[..., sc_base + 3].to(torch.int32)
+    v_zero = fp16_lut[(z_lo | (z_hi << 8))]
+
+    value = v_indices * v_scale + v_zero
+
+    return key.to(torch.float16), value.to(torch.float16)
+
+
+# Try torch.compile on the fused dequant function.
+# If the NPU backend does not support it, fall back to the eager path.
+try:
+    _compiled_dequant_kv_4bit = torch.compile(_compiled_dequant_kv_4bit)
+    _HAS_COMPILE = True
+except Exception:
+    _HAS_COMPILE = False
+
 
 def _unpack_mse_key(
     slot_data: torch.Tensor,
@@ -263,20 +337,32 @@ def _gather_and_dequant_kv(
     # Flatten to (total_tokens * Hk, slot_size) for batch unpacking
     flat_data = valid_data.reshape(-1, slot_size)
 
-    # Vectorized key dequantization
-    if key_fp8:
-        all_keys = _unpack_fp8_key(flat_data, head_dim)
-    else:
-        all_keys = _unpack_mse_key(
-            flat_data, centroids, mse_bits, mse_bytes, head_dim, norm_correction,
-            key_lut=key_lut,
-        )
-
-    # Vectorized value dequantization
-    all_values = _unpack_value(
-        flat_data, key_packed_size, value_quant_bits, val_data_bytes, head_dim,
-        val_idx_lut=val_idx_lut,
+    # Dequantize keys + values
+    use_compile = (
+        _HAS_COMPILE
+        and not key_fp8
+        and key_lut is not None
+        and val_idx_lut is not None
     )
+    if use_compile:
+        all_keys, all_values = _compiled_dequant_kv_4bit(
+            flat_data, key_lut, val_idx_lut,
+            _get_fp16_lut(device),
+            mse_bytes, head_dim, key_packed_size, val_data_bytes,
+            norm_correction,
+        )
+    else:
+        if key_fp8:
+            all_keys = _unpack_fp8_key(flat_data, head_dim)
+        else:
+            all_keys = _unpack_mse_key(
+                flat_data, centroids, mse_bits, mse_bytes, head_dim,
+                norm_correction, key_lut=key_lut,
+            )
+        all_values = _unpack_value(
+            flat_data, key_packed_size, value_quant_bits, val_data_bytes,
+            head_dim, val_idx_lut=val_idx_lut,
+        )
 
     # Reshape to (total_tokens, Hk, D) and cast to target dtype
     key = all_keys.reshape(-1, num_kv_heads, head_dim).to(target_dtype)
@@ -347,20 +433,32 @@ def npu_turboquant_decode_attention(
     # Flatten to (n_used * block_size * Hk, slot_size) for batch unpacking
     flat_data = all_block_data.reshape(-1, slot_size)
 
-    # Vectorized key dequantization
-    if key_fp8:
-        all_keys = _unpack_fp8_key(flat_data, D)
-    else:
-        all_keys = _unpack_mse_key(
-            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction,
-            key_lut=key_lut,
-        )
-
-    # Vectorized value dequantization
-    all_values = _unpack_value(
-        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D,
-        val_idx_lut=val_idx_lut,
+    # Dequantize keys + values
+    use_compile = (
+        _HAS_COMPILE
+        and not key_fp8
+        and key_lut is not None
+        and val_idx_lut is not None
     )
+    if use_compile:
+        all_keys, all_values = _compiled_dequant_kv_4bit(
+            flat_data, key_lut, val_idx_lut,
+            _get_fp16_lut(device),
+            mse_bytes, D, key_packed_size, val_data_bytes,
+            norm_correction,
+        )
+    else:
+        if key_fp8:
+            all_keys = _unpack_fp8_key(flat_data, D)
+        else:
+            all_keys = _unpack_mse_key(
+                flat_data, centroids, mse_bits, mse_bytes, D, norm_correction,
+                key_lut=key_lut,
+            )
+        all_values = _unpack_value(
+            flat_data, key_packed_size, value_quant_bits, val_data_bytes, D,
+            val_idx_lut=val_idx_lut,
+        )
 
     # Reshape to paged cache format: (n_used, block_size, Hk * D)
     key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
