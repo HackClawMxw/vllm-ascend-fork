@@ -84,12 +84,11 @@ def _compiled_dequant_kv_4bit(
 
 
 # Try torch.compile on the fused dequant function.
-# If the NPU backend does not support it, fall back to the eager path.
-try:
-    _compiled_dequant_kv_4bit = torch.compile(_compiled_dequant_kv_4bit)
-    _HAS_COMPILE = True
-except Exception:
-    _HAS_COMPILE = False
+_compiled_dequant_kv_4bit = torch.compile(_compiled_dequant_kv_4bit)
+
+# Compilation actually happens on first call; if it fails we flip this to
+# False and permanently fall back to the eager path.
+_compile_ok: bool = True
 
 
 def _unpack_mse_key(
@@ -339,19 +338,26 @@ def _gather_and_dequant_kv(
 
     # Dequantize keys + values
     use_compile = (
-        _HAS_COMPILE
+        _compile_ok
         and not key_fp8
         and key_lut is not None
         and val_idx_lut is not None
     )
     if use_compile:
-        all_keys, all_values = _compiled_dequant_kv_4bit(
-            flat_data, key_lut, val_idx_lut,
-            _get_fp16_lut(device),
-            mse_bytes, head_dim, key_packed_size, val_data_bytes,
-            norm_correction,
-        )
-    else:
+        try:
+            all_keys, all_values = _compiled_dequant_kv_4bit(
+                flat_data, key_lut, val_idx_lut,
+                _get_fp16_lut(device),
+                mse_bytes, head_dim, key_packed_size, val_data_bytes,
+                norm_correction,
+            )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            _compile_ok = False  # permanently fall back
+            use_compile = False
+
+    if not use_compile:
         if key_fp8:
             all_keys = _unpack_fp8_key(flat_data, head_dim)
         else:
@@ -435,19 +441,26 @@ def npu_turboquant_decode_attention(
 
     # Dequantize keys + values
     use_compile = (
-        _HAS_COMPILE
+        _compile_ok
         and not key_fp8
         and key_lut is not None
         and val_idx_lut is not None
     )
     if use_compile:
-        all_keys, all_values = _compiled_dequant_kv_4bit(
-            flat_data, key_lut, val_idx_lut,
-            _get_fp16_lut(device),
-            mse_bytes, D, key_packed_size, val_data_bytes,
-            norm_correction,
-        )
-    else:
+        try:
+            all_keys, all_values = _compiled_dequant_kv_4bit(
+                flat_data, key_lut, val_idx_lut,
+                _get_fp16_lut(device),
+                mse_bytes, D, key_packed_size, val_data_bytes,
+                norm_correction,
+            )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            _compile_ok = False
+            use_compile = False
+
+    if not use_compile:
         if key_fp8:
             all_keys = _unpack_fp8_key(flat_data, D)
         else:
