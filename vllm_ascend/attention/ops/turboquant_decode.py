@@ -60,8 +60,8 @@ def _compiled_dequant_kv_4bit(
         key = key / torch.sqrt(c_norm_sq + 1e-16)
 
     # Vec norm via LUT (avoids .view() bitcast that blocks compile fusion)
-    n_lo = slot_data[..., mse_bytes].to(torch.int32)
-    n_hi = slot_data[..., mse_bytes + 1].to(torch.int32)
+    n_lo = slot_data[..., mse_bytes:mse_bytes + 1].to(torch.int32)
+    n_hi = slot_data[..., mse_bytes + 1:mse_bytes + 2].to(torch.int32)
     vec_norm = fp16_lut[(n_lo | (n_hi << 8))]
     key = vec_norm * key
 
@@ -70,12 +70,12 @@ def _compiled_dequant_kv_4bit(
     v_indices = val_idx_lut[v_bytes].reshape(N, head_dim)
 
     sc_base = key_packed_size + val_data_bytes
-    s_lo = slot_data[..., sc_base].to(torch.int32)
-    s_hi = slot_data[..., sc_base + 1].to(torch.int32)
+    s_lo = slot_data[..., sc_base:sc_base + 1].to(torch.int32)
+    s_hi = slot_data[..., sc_base + 1:sc_base + 2].to(torch.int32)
     v_scale = fp16_lut[(s_lo | (s_hi << 8))]
 
-    z_lo = slot_data[..., sc_base + 2].to(torch.int32)
-    z_hi = slot_data[..., sc_base + 3].to(torch.int32)
+    z_lo = slot_data[..., sc_base + 2:sc_base + 3].to(torch.int32)
+    z_hi = slot_data[..., sc_base + 3:sc_base + 4].to(torch.int32)
     v_zero = fp16_lut[(z_lo | (z_hi << 8))]
 
     value = v_indices * v_scale + v_zero
