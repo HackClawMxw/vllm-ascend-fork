@@ -337,6 +337,7 @@ def _gather_and_dequant_kv(
     flat_data = valid_data.reshape(-1, slot_size)
 
     # Dequantize keys + values
+    global _compile_ok
     use_compile = (
         _compile_ok
         and not key_fp8
@@ -354,7 +355,7 @@ def _gather_and_dequant_kv(
         except Exception:
             import traceback
             traceback.print_exc()
-            _compile_ok = False  # permanently fall back
+            _compile_ok = False
             use_compile = False
 
     if not use_compile:
@@ -440,6 +441,7 @@ def npu_turboquant_decode_attention(
     flat_data = all_block_data.reshape(-1, slot_size)
 
     # Dequantize keys + values
+    global _compile_ok
     use_compile = (
         _compile_ok
         and not key_fp8
