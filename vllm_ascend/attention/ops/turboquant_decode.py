@@ -27,8 +27,11 @@ try:
     if os.path.exists(_lib_path):
         torch.ops.load_library(_lib_path)
         _tq_fused_decode_loaded = True
-except Exception:
-    pass
+        print(f"[TQ] Fused decode kernel loaded: {_lib_path}")
+    else:
+        print(f"[TQ] Fused decode kernel NOT found at: {_lib_path}")
+except Exception as e:
+    print(f"[TQ] Failed to load fused decode kernel: {e}")
 
 
 def _unpack_mse_key(
@@ -353,6 +356,18 @@ def npu_turboquant_decode_attention(
             block_size=block_size,
             norm_correction=norm_correction,
         )
+
+    # Diagnostic: why fused kernel was not used (print once)
+    if not hasattr(npu_turboquant_decode_attention, '_diag_printed'):
+        npu_turboquant_decode_attention._diag_printed = True
+        reasons = []
+        if not _tq_fused_decode_loaded:
+            reasons.append("kernel not loaded")
+        if key_fp8:
+            reasons.append("key_fp8=True")
+        if mse_bits != 4:
+            reasons.append(f"mse_bits={mse_bits} (!=4)")
+        print(f"[TQ] Using Python fallback decode path. Reasons: {', '.join(reasons)}")
 
     # Fallback: original Python dequant + FIA path
     mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0

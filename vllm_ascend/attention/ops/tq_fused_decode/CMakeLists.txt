@@ -91,7 +91,16 @@ target_link_libraries(tq_fused_decode_ops
     platform
 )
 set_target_properties(tq_fused_decode_ops PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/lib"
     BUILD_WITH_INSTALL_RPATH TRUE
     CXX_VISIBILITY_PRESET hidden
+)
+# Ensure the kernel .so (built into lib/) is findable at runtime
+# by also setting the build-time RPATH
+set_target_properties(tq_fused_decode_ops PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}/lib"
+)
+set_target_properties(tq_fused_decode_kernels PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
 )
