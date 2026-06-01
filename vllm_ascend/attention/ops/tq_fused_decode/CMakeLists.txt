@@ -72,11 +72,14 @@ add_library(tq_fused_decode_ops SHARED
 )
 target_include_directories(tq_fused_decode_ops PRIVATE
     ${TORCH_NPU_DIR}/include
+    ${TORCH_NPU_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
     ${CMAKE_CURRENT_SOURCE_DIR}/op_extension
 )
+# CANN library paths for ascendcl, tiling_api, register, platform
 target_link_directories(tq_fused_decode_ops PRIVATE
     ${TORCH_NPU_DIR}/lib
+    ${_cann_root}/lib64
 )
 target_link_libraries(tq_fused_decode_ops
     tq_fused_decode_kernels

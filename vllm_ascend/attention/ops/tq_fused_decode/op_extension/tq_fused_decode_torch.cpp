@@ -2,8 +2,7 @@
 #include "../op_kernel/tq_fused_decode_tiling.h"
 
 #include <acl/acl.h>
-#include <c10/npu/NPUStream.h>
-#include <c10/npu/NPUGuard.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -46,13 +45,8 @@ torch::Tensor tq_fused_decode_torch(
 
     auto output = at::empty({B, Hq, D}, q.options().dtype(at::kHalf));
 
-    // Clear NPU stream (required before direct kernel call)
+    // Get NPU stream
     auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
-
-    // Query vector core count
-    uint32_t coreCount = 0;
-    int32_t deviceId = c10_npu::current_device();
-    aclrtGetDeviceInfo(deviceId, ACL_DEV_ATTR_VECTOR_CORE_NUM, &coreCount);
 
     // Compute tiling
     TqFusedDecodeTilingData tiling;
@@ -74,9 +68,10 @@ torch::Tensor tq_fused_decode_torch(
     tiling.normCorrection = norm_correction ? 1u : 0u;
     tiling.smScale = static_cast<float>(sm_scale);
 
-    uint32_t gridSize = tiling.gridSize;
-    uint32_t usedCores = (coreCount < gridSize) ? coreCount : gridSize;
-    if (usedCores == 0) usedCores = 1;
+    // Use gridSize as blockDim: each core handles one (batch, head) pair.
+    // Extra cores exit early via GetBlockIdx() >= gridSize check in kernel.
+    uint32_t blockDim = tiling.gridSize;
+    if (blockDim == 0) blockDim = 1;
 
     // Copy tiling to device via temporary tensor
     auto tilingTensor = at::from_blob(
@@ -85,7 +80,7 @@ torch::Tensor tq_fused_decode_torch(
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
     tq_fused_decode_kernel(
-        usedCores, nullptr, aclStream,
+        blockDim, nullptr, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
         sl.data_ptr(), ct.data_ptr(), output.data_ptr(),
         tilingTensor.data_ptr());
