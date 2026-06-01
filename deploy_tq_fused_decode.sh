@@ -81,15 +81,6 @@ sudo docker cp ${VLLM_ASCEND_HOST_DIR}/patch/platform/patch_tq_attention.py   ${
 # ========== 4. Copy & build Ascend C operator ==========
 if [ "$SKIP_KERNEL" = false ]; then
     echo "=== Copying tq_fused_decode source ==="
-    # Verify source exists on host
-    echo "Host op_kernel contents:"
-    ls -la ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/op_kernel/
-    if [ ! -f ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/op_kernel/tq_fused_decode_kernel.cpp ]; then
-        echo "ERROR: tq_fused_decode_kernel.cpp not found on host!"
-        echo "  Expected at: ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/op_kernel/"
-        echo "  Run 'git pull' in the repo root, then re-run this script."
-        exit 1
-    fi
     # Clean old files first — docker cp merges, doesn't replace
     sudo docker exec ${CONTAINER} rm -rf ${SITE}/attention/ops/tq_fused_decode/op_kernel \
                                           ${SITE}/attention/ops/tq_fused_decode/op_host \
@@ -104,9 +95,6 @@ if [ "$SKIP_KERNEL" = false ]; then
         ${CONTAINER}:${SITE}/attention/ops/tq_fused_decode/
     sudo docker cp ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/op_extension \
         ${CONTAINER}:${SITE}/attention/ops/tq_fused_decode/
-    # Verify copy succeeded
-    echo "Container op_kernel contents:"
-    sudo docker exec ${CONTAINER} ls -la ${SITE}/attention/ops/tq_fused_decode/op_kernel/
 
     echo "=== Building Ascend C operator (SOC_VERSION=${SOC_VERSION}) ==="
     sudo docker exec ${CONTAINER} bash -c "
