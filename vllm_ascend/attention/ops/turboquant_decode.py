@@ -13,9 +13,22 @@ vectorized tensor operations for performance on NPU.
 """
 
 import math
+import os
 
 import torch
 import torch_npu
+
+# Try to load the fused Ascend C decode operator
+_tq_fused_decode_loaded = False
+try:
+    _lib_path = os.path.join(os.path.dirname(__file__),
+                              "tq_fused_decode", "build",
+                              "libtq_fused_decode_ops.so")
+    if os.path.exists(_lib_path):
+        torch.ops.load_library(_lib_path)
+        _tq_fused_decode_loaded = True
+except Exception:
+    pass
 
 
 def _unpack_mse_key(
@@ -323,6 +336,25 @@ def npu_turboquant_decode_attention(
     slot_size = kv_cache.shape[3]
     device = query.device
 
+    # Fast path: use fused Ascend C kernel (single kernel launch)
+    if _tq_fused_decode_loaded and not key_fp8 and mse_bits == 4:
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        return torch.ops.npu.tq_fused_decode(
+            query[:B],
+            kv_cache,
+            block_table,
+            seq_lens_t,
+            centroids.to(torch.float32),
+            sm_scale=scale,
+            mse_bytes=math.ceil(D * mse_bits / 8),
+            key_packed_size=key_packed_size,
+            val_data_bytes=math.ceil(D * value_quant_bits / 8),
+            head_dim=D,
+            block_size=block_size,
+            norm_correction=norm_correction,
+        )
+
+    # Fallback: original Python dequant + FIA path
     mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
     val_data_bytes = math.ceil(D * value_quant_bits / 8)
 
