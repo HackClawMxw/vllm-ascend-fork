@@ -391,7 +391,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
     GlobalTensor<half> outOffsetGm;
     outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
     DataCopyPad(outOffsetGm, outFp16,
-                {1, static_cast<uint32_t>(tiling.headDim * sizeof(half)), 0, 0});
+                {1, static_cast<uint16_t>(tiling.headDim * sizeof(half)), 0, 0});
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(slotLocal);
 }
