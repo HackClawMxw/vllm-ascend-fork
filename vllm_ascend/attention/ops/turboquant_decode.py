@@ -360,8 +360,10 @@ def npu_turboquant_decode_attention(
     # Fast path: use fused Ascend C kernel (single kernel launch)
     if _tq_fused_decode_loaded and not key_fp8 and mse_bits == 4:
         seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        return torch.ops.npu.tq_fused_decode(
-            query[:B],
+        # Kernel expects fp16 query; convert from bf16 if needed
+        q_in = query[:B].to(torch.float16)
+        out = torch.ops.npu.tq_fused_decode(
+            q_in,
             kv_cache,
             block_table,
             seq_lens_t,
@@ -374,6 +376,7 @@ def npu_turboquant_decode_attention(
             block_size=block_size,
             norm_correction=norm_correction,
         )
+        return out.to(query.dtype)
 
     # Diagnostic: why fused kernel was not used (print once)
     if not hasattr(npu_turboquant_decode_attention, '_diag_printed'):

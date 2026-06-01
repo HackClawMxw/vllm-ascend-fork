@@ -21,6 +21,9 @@ constexpr uint32_t WEIGHTED_BUF_SIZE = HEAD_DIM * sizeof(float);     // 512
 constexpr uint32_t SLOT_BUF_ALIGNED = ((SLOT_SIZE + 31) / 32) * 32; // 160
 // Tiling struct padded to 32-byte alignment
 constexpr uint32_t TILING_BUF_ALIGNED = ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;
+// Slot queue buffer must hold the largest of: tiling (96B), slot data (160B),
+// or query/output half values (HEAD_DIM * 2 = 256B).
+constexpr uint32_t SLOT_QUEUE_BUF = HEAD_DIM * sizeof(half); // 256, already 32-byte aligned
 
 class KernelTqFusedDecode {
 public:
@@ -159,7 +162,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     uint32_t blockIdx = GetBlockIdx();
 
     // Init UB buffers
-    pipe.InitBuffer(slotQueue, 1, SLOT_BUF_ALIGNED);
+    pipe.InitBuffer(slotQueue, 1, SLOT_QUEUE_BUF);
     pipe.InitBuffer(queryBuf, QUERY_BUF_SIZE);
     pipe.InitBuffer(centroidBuf, CENTROID_BUF_SIZE);
     pipe.InitBuffer(accBuf, ACC_BUF_SIZE);
