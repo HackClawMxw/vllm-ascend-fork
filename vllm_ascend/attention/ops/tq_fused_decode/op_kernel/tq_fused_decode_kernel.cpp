@@ -17,7 +17,7 @@ constexpr uint32_t CENTROID_BUF_SIZE = CENTROID_TABLE_SIZE * sizeof(float); // 6
 constexpr uint32_t ACC_BUF_SIZE = HEAD_DIM * sizeof(float);          // 512
 constexpr uint32_t VAL_BUF_SIZE = HEAD_DIM * sizeof(float);          // 512
 constexpr uint32_t WEIGHTED_BUF_SIZE = HEAD_DIM * sizeof(float);     // 512
-// Slot data padded to 32-byte alignment for DataCopyPad
+// Slot data padded to 32-byte alignment for DataCopy
 constexpr uint32_t SLOT_BUF_ALIGNED = ((SLOT_SIZE + 31) / 32) * 32; // 160
 // Tiling struct padded to 32-byte alignment
 constexpr uint32_t TILING_BUF_ALIGNED = ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;
@@ -49,7 +49,7 @@ private:
     GlobalTensor<float> centroidsGm;
     GlobalTensor<half> outputGm;
 
-    // Raw GM base addresses for offset-based DataCopyPad
+    // Raw GM base addresses for offset-based DataCopy
     GM_ADDR queryRotBase_;
     GM_ADDR kvCacheBase_;
     GM_ADDR outputBase_;
@@ -79,10 +79,7 @@ private:
 // ---- Scalar math helpers using AscendC Vector API ----
 
 __aicore__ inline float KernelTqFusedDecode::ScalarExp(float x) {
-    // Use a small LocalTensor to compute exp of a single scalar
     LocalTensor<float> tmp;
-    // Allocate from valBuf temporarily (reuse valBuf since it's not
-    // needed during score computation)
     tmp = valBuf.Get<float>();
     tmp.SetValue(0, x);
     pipe_barrier(PIPE_V);
@@ -106,27 +103,23 @@ __aicore__ inline float KernelTqFusedDecode::ScalarSqrt(float x) {
 
 __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
     LocalTensor<uint8_t>& slotUb, uint32_t offset) {
-    // Read 2 bytes, reinterpret as fp16, cast to fp32
     uint16_t raw = (static_cast<uint16_t>(slotUb.GetValue(offset + 1)) << 8) |
                    static_cast<uint16_t>(slotUb.GetValue(offset));
-    // Bit-cast uint16 → half → float using union (safe in Ascend C)
     union { uint16_t u; half h; } cvt;
     cvt.u = raw;
     return static_cast<float>(cvt.h);
 }
 
-// ---- Tiling data read via DataCopyPad + GetValue ----
+// ---- Tiling data read via DataCopy + GetValue ----
 
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
     GlobalTensor<uint8_t> tilingGm;
     tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(tilingData));
     auto slotLocal = slotQueue.AllocTensor<uint8_t>();
-    DataCopyPad(slotLocal, tilingGm,
-                {1, static_cast<uint32_t>(sizeof(TqFusedDecodeTilingData)), 0, 0},
-                {false, 0, 0, 0});
+    // Copy aligned size (DataCopy requires 32-byte alignment)
+    DataCopy(slotLocal, tilingGm, TILING_BUF_ALIGNED);
     pipe_barrier(PIPE_V);
 
-    // Reinterpret slot data as int32 for structured reads
     auto s = slotLocal.ReinterpretCast<int32_t>();
 
     tiling.batchSize       = s.GetValue(0);
@@ -141,17 +134,13 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
     tiling.valDataBytes    = s.GetValue(9);
     tiling.slotSize        = s.GetValue(10);
     tiling.maxBlocksPerSeq = s.GetValue(11);
-    // uint64_t fields: blockStride at offset 12-13, slotStride at 14-15
-    // (each uint64 occupies 2 × uint32 slots)
     uint32_t lo12 = s.GetValue(12);
     uint32_t hi13 = s.GetValue(13);
     tiling.blockStride = (static_cast<uint64_t>(hi13) << 32) | lo12;
     uint32_t lo14 = s.GetValue(14);
     uint32_t hi15 = s.GetValue(15);
     tiling.slotStride = (static_cast<uint64_t>(hi15) << 32) | lo14;
-    // uint32_t normCorrection at offset 16
     tiling.normCorrection  = s.GetValue(16);
-    // float smScale at offset 17 (reinterpret uint32 as float)
     uint32_t rawScale = s.GetValue(17);
     union { uint32_t u; float f; } cvtScale;
     cvtScale.u = rawScale;
@@ -195,7 +184,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     centroidsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(centroids));
     outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output));
 
-    // Store raw base addresses for offset-based DataCopyPad
+    // Store raw base addresses for offset-based DataCopy
     queryRotBase_ = queryRot;
     kvCacheBase_ = kvCache;
     outputBase_ = output;
@@ -210,9 +199,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     queryOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRotBase_) + qOffset);
     auto slotForQ = slotQueue.AllocTensor<uint8_t>();
     auto queryHalfLocal = slotForQ.ReinterpretCast<half>();
-    DataCopyPad(queryHalfLocal, queryOffsetGm,
-                {1, static_cast<uint32_t>(HEAD_DIM * sizeof(half)), 0, 0},
-                {false, 0, 0, 0});
+    DataCopy(queryHalfLocal, queryOffsetGm, HEAD_DIM);
     pipe_barrier(PIPE_V);
     Cast(queryFp32, queryHalfLocal, RoundMode::CAST_NONE, HEAD_DIM);
     pipe_barrier(PIPE_V);
@@ -220,9 +207,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     // Load centroid table (16 fp32)
     auto centroidLocal = centroidBuf.Get<float>();
-    DataCopyPad(centroidLocal, centroidsGm,
-                {1, static_cast<uint32_t>(CENTROID_TABLE_SIZE * sizeof(float)), 0, 0},
-                {false, 0, 0, 0});
+    DataCopy(centroidLocal, centroidsGm, CENTROID_TABLE_SIZE);
     pipe_barrier(PIPE_V);
 
     // Initialize accumulator to zero
@@ -246,7 +231,6 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
     float normSq = 0.0f;
 
     if (tiling.normCorrection) {
-        // Compute raw_score and norm_sq in one pass
         for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
             uint8_t packed = slotUb.GetValue(byteIdx);
             uint32_t loIdx = packed & 0xF;
@@ -260,7 +244,6 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
         }
         rawScore *= 1.0f / ScalarSqrt(normSq + 1e-16f);
     } else {
-        // Compute raw_score only
         for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
             uint8_t packed = slotUb.GetValue(byteIdx);
             uint32_t loIdx = packed & 0xF;
@@ -273,7 +256,6 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
         }
     }
 
-    // Apply vec_norm and sm_scale
     float vecNorm = ReadFp16AsFp32(slotUb, MSE_BYTES);
     float score = rawScore * vecNorm * tiling.smScale;
 
@@ -308,7 +290,6 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
         valLocal.SetValue(byteIdx * 2 + 1, static_cast<float>((packed >> 4) & 0xF));
     }
 
-    // Read scale and zero (fp16 at fixed offsets)
     float vScale = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES);
     float vZero = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES + 2);
 
@@ -341,8 +322,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
                         + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
         GlobalTensor<half> outOffsetGm;
         outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
-        DataCopyPad(outOffsetGm, outFp16,
-                    {1, static_cast<uint16_t>(tiling.headDim * sizeof(half)), 0, 0});
+        DataCopy(outOffsetGm, outFp16, tiling.headDim);
         pipe_barrier(PIPE_V);
         slotQueue.FreeTensor(slotOut);
         return;
@@ -363,16 +343,13 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
                           + static_cast<uint64_t>(offsetInBlock) * tiling.slotStride
                           + static_cast<uint64_t>(kvHead_) * tiling.slotSize;
 
-        // Read slot data
+        // Read slot data (aligned size for DataCopy)
         GlobalTensor<uint8_t> kvSlotGm;
         kvSlotGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCacheBase_) + slotAddr);
-        DataCopyPad(slotLocal, kvSlotGm,
-                    {1, SLOT_SIZE, 0, 0},
-                    {false, 0, 0, 0});
+        DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
         pipe_barrier(PIPE_V);
 
         ComputeScoreAndAccumulate(slotLocal);
-        // No FreeTensor/AllocTensor — reuse same buffer
     }
 
     // Final normalization: output = acc / runningSum
@@ -390,8 +367,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
                     + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
     GlobalTensor<half> outOffsetGm;
     outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
-    DataCopyPad(outOffsetGm, outFp16,
-                {1, static_cast<uint16_t>(tiling.headDim * sizeof(half)), 0, 0});
+    DataCopy(outOffsetGm, outFp16, tiling.headDim);
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(slotLocal);
 }
