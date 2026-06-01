@@ -19,13 +19,28 @@ if(NOT ASCENDC_CMAKE OR NOT EXISTS "${ASCENDC_CMAKE}")
         "Cannot find ascendc.cmake under /usr/local/Ascend.\n"
         "Please pass -DASCENDC_CMAKE=/path/to/ascendc.cmake")
 endif()
-include("${ASCENDC_CMAKE}")
 
-# ---- SOC version (Ascend 910B = ascend910b) ----
+# ---- Derive CANN root from ascendc.cmake location ----
+# ascendc.cmake is at .../aarch64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake
+# go up 4 levels to reach the CANN installation root (e.g. cann-8.5.1/)
+get_filename_component(_ascendc_dir "${ASCENDC_CMAKE}" DIRECTORY)  # ascendc_kernel_cmake/
+get_filename_component(_ascendc_dir "${_ascendc_dir}" DIRECTORY)   # tikcpp/
+get_filename_component(_ascendc_dir "${_ascendc_dir}" DIRECTORY)   # aarch64-linux/
+get_filename_component(_cann_root "${_ascendc_dir}" DIRECTORY)     # cann-8.5.1/
+
+# ascendc.cmake requires ASCEND_CANN_PACKAGE_PATH to be set before include()
+if(NOT ASCEND_CANN_PACKAGE_PATH)
+    set(ASCEND_CANN_PACKAGE_PATH "${_cann_root}")
+endif()
+message(STATUS "ASCEND_CANN_PACKAGE_PATH = ${ASCEND_CANN_PACKAGE_PATH}")
+
+# ---- SOC version must be set before include() ----
 if(NOT SOC_VERSION)
     set(SOC_VERSION "ascend910b" CACHE STRING "Target SoC version")
 endif()
 message(STATUS "SOC_VERSION = ${SOC_VERSION}")
+
+include("${ASCENDC_CMAKE}")
 
 # ---- Find Python3 and Torch ----
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -39,16 +54,6 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 message(STATUS "torch_npu dir: ${TORCH_NPU_DIR}")
-
-# ---- Ascend include / lib paths (derived from cmake module location) ----
-get_filename_component(ASCEND_CANN_ROOT "${ASCENDC_CMAKE}" ABSOLUTE)
-# ascendc.cmake is at .../aarch64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake
-# go up 4 levels to reach the CANN installation root
-get_filename_component(ASCEND_CANN_ROOT "${ASCEND_CANN_ROOT}" DIRECTORY) # ascendc_kernel_cmake/
-get_filename_component(ASCEND_CANN_ROOT "${ASCEND_CANN_ROOT}" DIRECTORY) # tikcpp/
-get_filename_component(ASCEND_CANN_ROOT "${ASCEND_CANN_ROOT}" DIRECTORY) # aarch64-linux/
-get_filename_component(ASCEND_CANN_ROOT "${ASCEND_CANN_ROOT}" DIRECTORY) # cann-8.5.1/
-message(STATUS "CANN root (derived): ${ASCEND_CANN_ROOT}")
 
 # ---- Target 1: Ascend C kernel shared library ----
 # ascendc_library() compiles .asc/.cpp with the CCE compiler and produces
