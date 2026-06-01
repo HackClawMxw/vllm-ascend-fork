@@ -65,15 +65,7 @@ target_include_directories(tq_fused_decode_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
 )
 
-# ---- Target 2: Direct-invoke test executable ----
-ascendc_executable(tq_fused_decode_direct
-    op_host/tq_fused_decode_host.asc
-)
-target_link_libraries(tq_fused_decode_direct
-    tiling_api register platform unified_dlog dl m graph_base
-)
-
-# ---- Target 3: PyTorch extension shared library ----
+# ---- Target 2: PyTorch extension shared library ----
 add_library(tq_fused_decode_ops SHARED
     op_extension/tq_fused_decode_torch.cpp
     op_extension/register.cpp
