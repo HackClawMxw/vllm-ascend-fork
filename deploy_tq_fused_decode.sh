@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Deploy script for TurboQuant fused decode Ascend C operator.
+#
+# Runs on the HOST machine. Handles: container startup, file copy,
+# kernel compilation (inside container), and vLLM server launch.
+#
+# Prerequisites (on host):
+#   - Docker with NPU device passthrough
+#   - Source files at ${VLLM_ASCEND_HOST_DIR}
+#
+# Usage:
+#   bash deploy_tq_fused_decode.sh              # full deploy + build + serve
+#   bash deploy_tq_fused_decode.sh --skip-kernel  # skip kernel rebuild
+#   bash deploy_tq_fused_decode.sh --soc=ascend910b4  # override SoC version
+
 set -e
 
 CONTAINER=vllm-ascend
