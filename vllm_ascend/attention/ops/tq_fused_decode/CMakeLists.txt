@@ -59,7 +59,7 @@ message(STATUS "torch_npu dir: ${TORCH_NPU_DIR}")
 # ascendc_library() compiles .asc/.cpp with the CCE compiler and produces
 # a .so that contains both the device binary and the host-side launch stub.
 ascendc_library(tq_fused_decode_kernels SHARED
-    op_kernel/tq_fused_decode_kernel.asc
+    op_kernel/tq_fused_decode_kernel.cpp
 )
 target_include_directories(tq_fused_decode_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
