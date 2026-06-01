@@ -81,6 +81,11 @@ sudo docker cp ${VLLM_ASCEND_HOST_DIR}/patch/platform/patch_tq_attention.py   ${
 # ========== 4. Copy & build Ascend C operator ==========
 if [ "$SKIP_KERNEL" = false ]; then
     echo "=== Copying tq_fused_decode source ==="
+    # Clean old files first — docker cp merges, doesn't replace
+    sudo docker exec ${CONTAINER} rm -rf ${SITE}/attention/ops/tq_fused_decode/op_kernel \
+                                          ${SITE}/attention/ops/tq_fused_decode/op_host \
+                                          ${SITE}/attention/ops/tq_fused_decode/op_extension \
+                                          ${SITE}/attention/ops/tq_fused_decode/build
     sudo docker exec ${CONTAINER} mkdir -p ${SITE}/attention/ops/tq_fused_decode
     sudo docker cp ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/CMakeLists.txt \
         ${CONTAINER}:${SITE}/attention/ops/tq_fused_decode/
