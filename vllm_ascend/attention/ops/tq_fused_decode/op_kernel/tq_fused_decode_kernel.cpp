@@ -49,6 +49,11 @@ private:
     GlobalTensor<float> centroidsGm;
     GlobalTensor<half> outputGm;
 
+    // Raw GM base addresses for offset-based DataCopyPad
+    GM_ADDR queryRotBase_;
+    GM_ADDR kvCacheBase_;
+    GM_ADDR outputBase_;
+
     // UB buffers
     TBuf<QuePosition::VECCALC> queryBuf;
     TBuf<QuePosition::VECCALC> centroidBuf;
@@ -113,15 +118,14 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 // ---- Tiling data read via DataCopyPad + GetValue ----
 
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
+    GlobalTensor<uint8_t> tilingGm;
+    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(tilingData));
     auto slotLocal = slotQueue.AllocTensor<uint8_t>();
-    DataCopyPad(slotLocal, reinterpret_cast<__gm__ uint8_t*>(tilingData),
+    DataCopyPad(slotLocal, tilingGm,
                 {1, static_cast<uint32_t>(sizeof(TqFusedDecodeTilingData)), 0, 0},
                 {false, 0, 0, 0});
     pipe_barrier(PIPE_V);
 
-    // Read fields via GetValue with manual byte offsets
-    // uint32_t fields at known offsets in the struct
-    auto p = reinterpret_cast<__gm__ uint32_t*>(tilingData);
     // Reinterpret slot data as int32 for structured reads
     auto s = slotLocal.ReinterpretCast<int32_t>();
 
@@ -191,20 +195,26 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     centroidsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(centroids));
     outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output));
 
+    // Store raw base addresses for offset-based DataCopyPad
+    queryRotBase_ = queryRot;
+    kvCacheBase_ = kvCache;
+    outputBase_ = output;
+
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
     // Load query vector (HEAD_DIM fp16 → fp32 in UB)
     auto queryFp32 = queryBuf.Get<float>();
     uint64_t qOffset = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                      + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
+    GlobalTensor<half> queryOffsetGm;
+    queryOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRotBase_) + qOffset);
     auto slotForQ = slotQueue.AllocTensor<uint8_t>();
-    DataCopyPad(slotForQ,
-                reinterpret_cast<__gm__ uint8_t*>(&queryRotGm[qOffset]),
+    auto queryHalfLocal = slotForQ.ReinterpretCast<half>();
+    DataCopyPad(queryHalfLocal, queryOffsetGm,
                 {1, static_cast<uint32_t>(HEAD_DIM * sizeof(half)), 0, 0},
                 {false, 0, 0, 0});
     pipe_barrier(PIPE_V);
-    auto queryFp16Local = slotForQ.ReinterpretCast<half>();
-    Cast(queryFp32, queryFp16Local, RoundMode::CAST_NONE, HEAD_DIM);
+    Cast(queryFp32, queryHalfLocal, RoundMode::CAST_NONE, HEAD_DIM);
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(slotForQ);
 
@@ -329,8 +339,9 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         pipe_barrier(PIPE_V);
         uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                         + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
-        DataCopyPad(reinterpret_cast<__gm__ half*>(&outputGm[outOff]),
-                    outFp16,
+        GlobalTensor<half> outOffsetGm;
+        outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
+        DataCopyPad(outOffsetGm, outFp16,
                     {1, static_cast<uint32_t>(tiling.headDim * sizeof(half)), 0, 0},
                     {false, 0, 0, 0});
         pipe_barrier(PIPE_V);
@@ -354,8 +365,9 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
                           + static_cast<uint64_t>(kvHead_) * tiling.slotSize;
 
         // Read slot data
-        DataCopyPad(slotLocal,
-                    reinterpret_cast<__gm__ uint8_t*>(&kvCacheGm[slotAddr]),
+        GlobalTensor<uint8_t> kvSlotGm;
+        kvSlotGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCacheBase_) + slotAddr);
+        DataCopyPad(slotLocal, kvSlotGm,
                     {1, SLOT_SIZE, 0, 0},
                     {false, 0, 0, 0});
         pipe_barrier(PIPE_V);
@@ -377,8 +389,9 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
 
     uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                     + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
-    DataCopyPad(reinterpret_cast<__gm__ half*>(&outputGm[outOff]),
-                outFp16,
+    GlobalTensor<half> outOffsetGm;
+    outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
+    DataCopyPad(outOffsetGm, outFp16,
                 {1, static_cast<uint32_t>(tiling.headDim * sizeof(half)), 0, 0},
                 {false, 0, 0, 0});
     pipe_barrier(PIPE_V);
