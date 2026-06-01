@@ -12,6 +12,7 @@ All per-block / per-head Python loops have been replaced with
 vectorized tensor operations for performance on NPU.
 """
 
+import ctypes
 import math
 import os
 
@@ -21,15 +22,32 @@ import torch_npu
 # Try to load the fused Ascend C decode operator
 _tq_fused_decode_loaded = False
 try:
-    _lib_path = os.path.join(os.path.dirname(__file__),
-                              "tq_fused_decode", "build",
-                              "libtq_fused_decode_ops.so")
-    if os.path.exists(_lib_path):
-        torch.ops.load_library(_lib_path)
+    _build_dir = os.path.join(os.path.dirname(__file__),
+                               "tq_fused_decode", "build")
+    _ops_path = os.path.join(_build_dir, "libtq_fused_decode_ops.so")
+    _kern_path = os.path.join(_build_dir, "lib",
+                               "libtq_fused_decode_kernels.so")
+    if os.path.exists(_ops_path):
+        # Preload kernel .so into global scope so ops .so can resolve it
+        if os.path.exists(_kern_path):
+            ctypes.CDLL(_kern_path, mode=ctypes.RTLD_GLOBAL)
+            print(f"[TQ] Preloaded kernel: {_kern_path}")
+        else:
+            print(f"[TQ] WARNING: kernel .so not found at {_kern_path}")
+
+        # Try ctypes first for better error messages
+        try:
+            ctypes.CDLL(_ops_path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            print(f"[TQ] ctypes load error: {e}")
+            raise
+
+        # Load via torch for op registration
+        torch.ops.load_library(_ops_path)
         _tq_fused_decode_loaded = True
-        print(f"[TQ] Fused decode kernel loaded: {_lib_path}")
+        print(f"[TQ] Fused decode kernel loaded: {_ops_path}")
     else:
-        print(f"[TQ] Fused decode kernel NOT found at: {_lib_path}")
+        print(f"[TQ] Fused decode kernel NOT found at: {_ops_path}")
 except Exception as e:
     print(f"[TQ] Failed to load fused decode kernel: {e}")
 
