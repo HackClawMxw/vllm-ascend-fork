@@ -1,3 +1,4 @@
+#include "kernel_operator.h"
 #include "tq_fused_decode_tiling.h"
 
 using namespace AscendC;
