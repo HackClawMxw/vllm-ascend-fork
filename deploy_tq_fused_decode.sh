@@ -19,7 +19,7 @@ CONTAINER=vllm-ascend
 IMAGE=quay.io/ascend/vllm-ascend:v0.19.1rc1
 MODEL_DIR=/data/cx/model/llama3-8B-Ins
 VLLM_ASCEND_HOST_DIR=/data/cx/vllm-ascend/vllm_ascend
-SOC_VERSION="${SOC_VERSION:-ascend910b}"
+SOC_VERSION="${SOC_VERSION:-ascend910b4}"
 
 # Parse arguments
 SKIP_KERNEL=false
