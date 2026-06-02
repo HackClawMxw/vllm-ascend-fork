@@ -545,6 +545,13 @@ def _log_decode_diff(
         fb_sample = out_fb[0, 0, :8].detach().cpu().float().tolist()
         _tq_diag_log(f"  fused[0,0,:8]    = {[f'{v:+.3e}' for v in fused_sample]}")
         _tq_diag_log(f"  fallback[0,0,:8] = {[f'{v:+.3e}' for v in fb_sample]}")
+        # Full 128-dim dump of head 0 to expose the exact repeating pattern.
+        fused_full = out_fused[0, 0, :].detach().cpu().float()
+        unique_vals = torch.unique(fused_full)
+        _tq_diag_log(
+            f"  fused[0,0,:] unique={unique_vals.tolist()[:16]} "
+            f"(count={unique_vals.numel()})"
+        )
 
 
 def npu_turboquant_decode_attention(

@@ -326,6 +326,14 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
 __aicore__ inline void KernelTqFusedDecode::Process() {
     if (GetBlockIdx() >= tiling.gridSize) return;
 
+    // BUILD-VERIFICATION: this printf proves the kernel binary was rebuilt.
+    // If you see "TQ-KERNEL-V2" in the logs, the latest source is running.
+    // Only core 0 prints to avoid flooding.
+    if (GetBlockIdx() == 0) {
+        AscendC::printf("TQ-KERNEL-V2 seqLen=%d b=%d h=%d\n",
+                         seqLen_, batchIdx_, qheadIdx_);
+    }
+
     // Handle empty sequence
     if (seqLen_ == 0) {
         auto accLocal = accBuf.Get<float>();
