@@ -121,7 +121,9 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
     auto slotLocal = slotQueue.AllocTensor<uint8_t>();
     // Copy aligned size (DataCopy requires 32-byte alignment)
     DataCopy(slotLocal, tilingGm, TILING_BUF_ALIGNED);
-    pipe_barrier(PIPE_V);
+    // DataCopy is async DMA on MTE2 pipe; must wait before reading UB.
+    // pipe_barrier(PIPE_V) only synchronizes the V pipe, not MTE2.
+    PipeBarrier<PIPE_ALL>();
 
     auto s = slotLocal.ReinterpretCast<int32_t>();
 
@@ -203,7 +205,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     auto slotForQ = slotQueue.AllocTensor<uint8_t>();
     auto queryHalfLocal = slotForQ.ReinterpretCast<half>();
     DataCopy(queryHalfLocal, queryOffsetGm, HEAD_DIM);
-    pipe_barrier(PIPE_V);
+    PipeBarrier<PIPE_ALL>();
     Cast(queryFp32, queryHalfLocal, RoundMode::CAST_NONE, HEAD_DIM);
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(slotForQ);
@@ -211,7 +213,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     // Load centroid table (16 fp32)
     auto centroidLocal = centroidBuf.Get<float>();
     DataCopy(centroidLocal, centroidsGm, CENTROID_TABLE_SIZE);
-    pipe_barrier(PIPE_V);
+    PipeBarrier<PIPE_ALL>();
 
     // Initialize accumulator to zero
     auto accLocal = accBuf.Get<float>();
@@ -326,7 +328,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         GlobalTensor<half> outOffsetGm;
         outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
         DataCopy(outOffsetGm, outFp16, tiling.headDim);
-        pipe_barrier(PIPE_V);
+        PipeBarrier<PIPE_ALL>();
         slotQueue.FreeTensor(slotOut);
         return;
     }
@@ -350,7 +352,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         GlobalTensor<uint8_t> kvSlotGm;
         kvSlotGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCacheBase_) + slotAddr);
         DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
-        pipe_barrier(PIPE_V);
+        PipeBarrier<PIPE_ALL>();
 
         ComputeScoreAndAccumulate(slotLocal);
     }
@@ -371,7 +373,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
     GlobalTensor<half> outOffsetGm;
     outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
     DataCopy(outOffsetGm, outFp16, tiling.headDim);
-    pipe_barrier(PIPE_V);
+    PipeBarrier<PIPE_ALL>();
     slotQueue.FreeTensor(slotLocal);
 }
 

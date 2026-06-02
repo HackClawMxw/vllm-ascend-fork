@@ -92,7 +92,10 @@ class TurboQuantConfig:
     @property
     def slot_size_aligned(self) -> int:
         s = self.slot_size
-        return s + (s % 2)
+        # Pad to 32-byte alignment for Ascend C DataCopy requirements.
+        # DataCopy on dav_c100 requires both address and size to be
+        # 32-byte aligned; non-aligned access produces incorrect data.
+        return ((s + 31) // 32) * 32
 
     @staticmethod
     def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
