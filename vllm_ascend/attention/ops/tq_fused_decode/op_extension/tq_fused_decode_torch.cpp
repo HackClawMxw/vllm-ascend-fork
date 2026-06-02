@@ -82,16 +82,29 @@ torch::Tensor tq_fused_decode_torch(
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
     printf("[TQ-HOST] Launching kernel blockDim=%d gridSize=%d B=%ld Hq=%ld "
-           "headDim=%d blockSize=%d slotSize=%d\n",
+           "headDim=%d blockSize=%d slotSize=%d stream=%p\n",
            blockDim, tiling.gridSize, B, Hq,
-           tiling.headDim, tiling.blockSize, tiling.slotSize);
+           tiling.headDim, tiling.blockSize, tiling.slotSize,
+           (void*)aclStream);
     fflush(stdout);
     tq_fused_decode_kernel(
         blockDim, nullptr, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
         sl.data_ptr(), ct.data_ptr(), output.data_ptr(),
         tilingTensor.data_ptr());
-    printf("[TQ-HOST] Kernel launch returned (async, may not have completed)\n");
+    printf("[TQ-HOST] Kernel stub returned\n");
+    fflush(stdout);
+
+    // Synchronize to force kernel completion and capture device-side errors.
+    // If this returns non-zero, the kernel failed on the device.
+    aclError aclRet = aclrtSynchronizeStream(aclStream);
+    printf("[TQ-HOST] aclrtSynchronizeStream = %d (0=SUCCESS)\n", (int)aclRet);
+    fflush(stdout);
+
+    // Read back first element to verify if kernel wrote anything.
+    auto check = output[0][0][0].item<at::Half>();
+    printf("[TQ-HOST] output[0][0][0] = %f (expected 1.0 if kernel ran)\n",
+           static_cast<float>(check));
     fflush(stdout);
 
     return output;
