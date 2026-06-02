@@ -381,6 +381,15 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
     Muls(accLocal, accLocal, invSum, tiling.headDim);
     pipe_barrier(PIPE_V);
 
+    // BUILD-VERIFICATION (temporary): multiply output by 2.0 so the
+    // kernel binary leaves a fingerprint on every output element.
+    // If the kernel .so was actually rebuilt with this source, the
+    // fused diagnostic output should show ±2.859375 instead of ±1.4296875.
+    // If you still see ±1.4296875, the binary on disk is stale and the
+    // deploy script's rebuild step did not pick up these source changes.
+    Muls(accLocal, accLocal, 2.0f, tiling.headDim);
+    pipe_barrier(PIPE_V);
+
     // Cast fp32 → fp16 and write output
     auto outFp16 = slotLocal.ReinterpretCast<half>();
     Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
