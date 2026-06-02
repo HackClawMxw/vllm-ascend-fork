@@ -55,18 +55,33 @@ except Exception as e:
 # ============================================================================
 # Diagnostic configuration (env-controlled)
 # ============================================================================
-# TQ_DIAG_DUAL_PATH=1 (default): run BOTH fused kernel and Python fallback,
-#   log max absolute difference, return fallback for correctness.
-#   Set to 0 to use fused-only (original behavior, may produce garbled output).
-# TQ_DIAG_LOG_LIMIT=N: only log first N decode calls per process (default 30).
-#   Further calls still run both paths (for correctness) but stop printing.
+# TQ_DIAG_DUAL_PATH=1 (default): enable the diagnostic branch when the fused
+#   kernel is eligible. Within this branch, TQ_DIAG_SAMPLE controls frequency.
+#   Set to 0 to bypass entirely and use fused-only (the goal state once the
+#   kernel is verified correct).
+# TQ_DIAG_SAMPLE=N: only run dual-path on every Nth call (1-indexed).
+#   0 (default) = run dual-path EVERY call (safe+slow; always returns fallback).
+#   N>0          = run dual-path every Nth call; other calls return fused
+#                  directly. With N=10 you get ~10% diagnostic overhead and
+#                  ~90% fast fused-only calls. Recommended AFTER the kernel
+#                  fix is verified; if logs show consistent "ok" you can
+#                  graduate to TQ_DIAG_DUAL_PATH=0.
+# TQ_DIAG_LOG_LIMIT=N: only log first N DIAGNOSTIC calls per process (default
+#   30). Diagnostic calls past this limit still run both paths (and still
+#   return fallback for safety on the diagnostic call) but stop printing.
 # TQ_DIAG_DIFF_THRESHOLD: log "GARBLED" if max_diff > threshold (default 1e-2).
 _TQ_DIAG_DUAL_PATH = os.environ.get("TQ_DIAG_DUAL_PATH", "1") not in ("0", "false", "False")
+_TQ_DIAG_SAMPLE = int(os.environ.get("TQ_DIAG_SAMPLE", "0"))
 _TQ_DIAG_LOG_LIMIT = int(os.environ.get("TQ_DIAG_LOG_LIMIT", "30"))
 _TQ_DIAG_DIFF_THRESHOLD = float(os.environ.get("TQ_DIAG_DIFF_THRESHOLD", "1e-2"))
 
 # Per-process diagnostic state (initialized lazily inside the call path)
-_TQ_DIAG_STATE = {"count": 0, "garbled_count": 0, "max_diff_seen": 0.0}
+_TQ_DIAG_STATE = {
+    "total_count": 0,    # all fused-eligible calls (diagnostic + fast)
+    "diag_count": 0,     # calls that actually ran dual-path
+    "garbled_count": 0,
+    "max_diff_seen": 0.0,
+}
 
 
 def _tq_diag_log(*args, **kwargs):
@@ -481,13 +496,14 @@ def _log_decode_diff(
 ) -> None:
     """Compare fused vs fallback outputs and log a single summary line.
 
-    Logs are rate-limited by _TQ_DIAG_LOG_LIMIT. After the limit is reached,
-    this function becomes a no-op (the caller still returns the fallback
-    tensor, so correctness is preserved — we just stop spamming logs).
+    Logs are rate-limited by _TQ_DIAG_LOG_LIMIT (counted against diagnostic
+    calls only, not total calls). After the limit is reached, this function
+    becomes a no-op (the caller still returns the fallback tensor, so
+    correctness is preserved — we just stop spamming logs).
     """
     state = _TQ_DIAG_STATE
-    state["count"] += 1
-    n = state["count"]
+    state["diag_count"] += 1
+    n = state["diag_count"]
     if n > _TQ_DIAG_LOG_LIMIT:
         return
 
@@ -594,25 +610,47 @@ def npu_turboquant_decode_attention(
 
     # Fused kernel is eligible. Decide between dual-path diagnostic and fast path.
     if _TQ_DIAG_DUAL_PATH:
-        # Run both paths and compare. The fused result is throwaway for
-        # correctness (we return fallback), but the diff tells us exactly
-        # where and how badly the kernel diverges.
-        out_fused = _call_fused_kernel(
+        # Sample the dual-path diagnostic to avoid paying the fallback cost
+        # on every decode call. TQ_DIAG_SAMPLE=0 → every call (safe+slow).
+        # TQ_DIAG_SAMPLE=N>0 → every Nth call diagnostic, others return fused.
+        state = _TQ_DIAG_STATE
+        state["total_count"] += 1
+        do_diag = (
+            _TQ_DIAG_SAMPLE <= 0
+            or (state["total_count"] % _TQ_DIAG_SAMPLE == 0)
+        )
+
+        if do_diag:
+            # Run both paths and compare. The fused result is throwaway for
+            # correctness (we return fallback), but the diff tells us exactly
+            # where and how badly the kernel diverges.
+            out_fused = _call_fused_kernel(
+                query, kv_cache, block_table, seq_lens, scale,
+                mse_bits, key_packed_size, value_quant_bits,
+                D, block_size, centroids, norm_correction,
+                target_dtype,
+            )
+            out_fb = _decode_fallback_impl(
+                query, kv_cache, block_table, seq_lens, scale,
+                key_fp8, mse_bits, key_packed_size, value_quant_bits,
+                head_dim, num_kv_heads, num_heads, centroids, norm_correction,
+                target_dtype, key_lut, val_idx_lut,
+            )
+            _log_decode_diff(out_fused, out_fb, seq_lens, head_dim=D, num_heads=num_heads)
+            return out_fb
+
+        # Fast lane: skip the fallback and return fused directly. This is
+        # the target steady state; sampling just keeps an occasional
+        # verification ping in the logs.
+        return _call_fused_kernel(
             query, kv_cache, block_table, seq_lens, scale,
             mse_bits, key_packed_size, value_quant_bits,
             D, block_size, centroids, norm_correction,
             target_dtype,
         )
-        out_fb = _decode_fallback_impl(
-            query, kv_cache, block_table, seq_lens, scale,
-            key_fp8, mse_bits, key_packed_size, value_quant_bits,
-            head_dim, num_kv_heads, num_heads, centroids, norm_correction,
-            target_dtype, key_lut, val_idx_lut,
-        )
-        _log_decode_diff(out_fused, out_fb, seq_lens, head_dim=D, num_heads=num_heads)
-        return out_fb
 
-    # Pure fused path (original behavior — used after the kernel is fixed).
+    # Pure fused path (original behavior — used after the kernel is fixed
+    # and dual-path diagnostic is no longer needed).
     return _call_fused_kernel(
         query, kv_cache, block_table, seq_lens, scale,
         mse_bits, key_packed_size, value_quant_bits,

@@ -85,9 +85,13 @@ __aicore__ inline float KernelTqFusedDecode::ScalarExp(float x) {
     LocalTensor<float> tmp;
     tmp = valBuf.Get<float>();
     tmp.SetValue(0, x);
-    pipe_barrier(PIPE_V);
+    // SetValue is on the Scalar pipe; Exp is on Vector pipe.
+    // pipe_barrier(PIPE_V) does NOT synchronize the Scalar pipe.
+    // Without PIPE_ALL, the Vector unit may read stale UB.
+    PipeBarrier<PIPE_ALL>();
     Exp(tmp, tmp, 1);
-    pipe_barrier(PIPE_V);
+    // Same reasoning: GetValue on Scalar pipe must wait for Vector write.
+    PipeBarrier<PIPE_ALL>();
     float result = tmp.GetValue(0);
     return result;
 }
@@ -95,9 +99,9 @@ __aicore__ inline float KernelTqFusedDecode::ScalarExp(float x) {
 __aicore__ inline float KernelTqFusedDecode::ScalarSqrt(float x) {
     LocalTensor<float> tmp = valBuf.Get<float>();
     tmp.SetValue(0, x);
-    pipe_barrier(PIPE_V);
+    PipeBarrier<PIPE_ALL>();
     Sqrt(tmp, tmp, 1);
-    pipe_barrier(PIPE_V);
+    PipeBarrier<PIPE_ALL>();
     float result = tmp.GetValue(0);
     return result;
 }
@@ -294,6 +298,12 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
         valLocal.SetValue(byteIdx * 2 + 0, static_cast<float>(packed & 0xF));
         valLocal.SetValue(byteIdx * 2 + 1, static_cast<float>((packed >> 4) & 0xF));
     }
+    // SetValue goes through the Scalar pipe; the subsequent Muls/Adds below
+    // run on the Vector pipe and read valLocal from UB. Without PIPE_ALL,
+    // the Vector unit can observe stale UB contents (the SetValue writes
+    // are still in flight on the Scalar pipe). This was the most likely
+    // root cause of the constant ±1.430 fused-output pattern.
+    PipeBarrier<PIPE_ALL>();
 
     float vScale = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES);
     float vZero = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES + 2);
@@ -321,7 +331,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         auto accLocal = accBuf.Get<float>();
         auto slotOut = slotQueue.AllocTensor<uint8_t>();
         auto outFp16 = slotOut.ReinterpretCast<half>();
-        Cast(outFp16, accLocal, RoundMode::CAST_NONE, tiling.headDim);
+        Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
         pipe_barrier(PIPE_V);
         uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                         + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
@@ -365,7 +375,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
 
     // Cast fp32 → fp16 and write output
     auto outFp16 = slotLocal.ReinterpretCast<half>();
-    Cast(outFp16, accLocal, RoundMode::CAST_NONE, tiling.headDim);
+    Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
     pipe_barrier(PIPE_V);
 
     uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
