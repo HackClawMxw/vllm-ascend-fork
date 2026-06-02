@@ -35,8 +35,10 @@ endif()
 message(STATUS "ASCEND_CANN_PACKAGE_PATH = ${ASCEND_CANN_PACKAGE_PATH}")
 
 # ---- SOC version must be set before include() ----
+# Must match the actual device: npu-smi info shows Ascend910B4, not generic Ascend910B.
+# Mismatch causes runtime error "socversion ... does not match the current device".
 if(NOT SOC_VERSION)
-    set(SOC_VERSION "ascend910b" CACHE STRING "Target SoC version")
+    set(SOC_VERSION "ascend910b4" CACHE STRING "Target SoC version")
 endif()
 message(STATUS "SOC_VERSION = ${SOC_VERSION}")
 
