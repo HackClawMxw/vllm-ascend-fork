@@ -332,46 +332,75 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
     pipe_barrier(PIPE_V);
 }
 
-// ---- Process: DIAGNOSTIC minimal write test ----
-// Bypasses ALL attention computation. Writes float(blockIdx+1) to every
-// output element. Combined with the -42.0 pre-fill sentinel in the torch
-// extension, this definitively answers whether the kernel runs:
-//   output = -42.0  →  kernel did NOT run (launch failure or Init crash)
-//   output = 1..32  →  kernel runs, output path works (bug is in computation)
+// ---- Process: main loop over all KV tokens ----
 
 __aicore__ inline void KernelTqFusedDecode::Process() {
     if (GetBlockIdx() >= tiling.gridSize) return;
 
     if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-DIAG block=%d grid=%d b=%d h=%d seq=%d headDim=%d\n",
+        AscendC::printf("TQ-PROCESS block=%d grid=%d seq=%d headDim=%d\n",
                          GetBlockIdx(), tiling.gridSize,
-                         batchIdx_, qheadIdx_, seqLen_, tiling.headDim);
+                         seqLen_, tiling.headDim);
     }
 
-    // Write blockIdx+1 as a float to every output element.
-    // Head 0 → all 1.0, head 1 → all 2.0, ..., head 31 → all 32.0.
+    // Handle empty sequence
+    if (seqLen_ == 0) {
+        auto accLocal = accBuf.Get<float>();
+        auto slotOut = slotQueue.AllocTensor<uint8_t>();
+        auto outFp16 = slotOut.ReinterpretCast<half>();
+        Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
+        pipe_barrier(PIPE_V);
+        uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
+                        + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
+        GlobalTensor<half> outOffsetGm;
+        outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
+        DataCopy(outOffsetGm, outFp16, tiling.headDim);
+        PipeBarrier<PIPE_ALL>();
+        slotQueue.FreeTensor(slotOut);
+        return;
+    }
+
+    // Allocate slot buffer once, reuse for all tokens
+    auto slotLocal = slotQueue.AllocTensor<uint8_t>();
+
+    for (uint32_t tokenPos = 0; tokenPos < seqLen_; tokenPos++) {
+        // Paged address computation
+        uint32_t virtualBlock = tokenPos / tiling.blockSize;
+        uint32_t offsetInBlock = tokenPos % tiling.blockSize;
+        uint32_t physicalBlock = static_cast<uint32_t>(
+            blockTableGm.GetValue(
+                static_cast<int64_t>(batchIdx_) * tiling.maxBlocksPerSeq + virtualBlock));
+
+        uint64_t slotAddr = static_cast<uint64_t>(physicalBlock) * tiling.blockStride
+                          + static_cast<uint64_t>(offsetInBlock) * tiling.slotStride
+                          + static_cast<uint64_t>(kvHead_) * tiling.slotSize;
+
+        // Read slot data (aligned size for DataCopy)
+        GlobalTensor<uint8_t> kvSlotGm;
+        kvSlotGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCacheBase_) + slotAddr);
+        DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
+        PipeBarrier<PIPE_ALL>();
+
+        ComputeScoreAndAccumulate(slotLocal);
+    }
+
+    // Final normalization: output = acc / runningSum
     auto accLocal = accBuf.Get<float>();
-    float val = static_cast<float>(GetBlockIdx() + 1);
-    Duplicate(accLocal, val, HEAD_DIM);
+    float invSum = 1.0f / runningSum_;
+    Muls(accLocal, accLocal, invSum, tiling.headDim);
     pipe_barrier(PIPE_V);
 
-    auto slotLocal = slotQueue.AllocTensor<uint8_t>();
+    // Cast fp32 → fp16 and write output
     auto outFp16 = slotLocal.ReinterpretCast<half>();
-    Cast(outFp16, accLocal, RoundMode::CAST_ROUND, HEAD_DIM);
+    Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
     pipe_barrier(PIPE_V);
 
     uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                     + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
     GlobalTensor<half> outOffsetGm;
     outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
-    DataCopy(outOffsetGm, outFp16, HEAD_DIM);
+    DataCopy(outOffsetGm, outFp16, tiling.headDim);
     PipeBarrier<PIPE_ALL>();
-
-    if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-DIAG-DONE block=%d wrote val=%f\n",
-                         GetBlockIdx(), val);
-    }
-
     slotQueue.FreeTensor(slotLocal);
 }
 
