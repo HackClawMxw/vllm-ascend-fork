@@ -43,7 +43,9 @@ torch::Tensor tq_fused_decode_torch(
     int64_t slot_size = kv.size(3);
     int64_t max_blocks = bt.size(1);
 
-    auto output = at::empty({B, Hq, D}, q.options().dtype(at::kHalf));
+    // DIAGNOSTIC: pre-fill with sentinel to detect if kernel actually writes.
+    // If output is still -42.0 after kernel launch, the kernel did NOT run.
+    auto output = at::full({B, Hq, D}, -42.0, q.options().dtype(at::kHalf));
 
     // Get NPU stream
     auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
@@ -79,11 +81,18 @@ torch::Tensor tq_fused_decode_torch(
         at::kByte).to(q.device()).clone();
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
+    printf("[TQ-HOST] Launching kernel blockDim=%d gridSize=%d B=%ld Hq=%ld "
+           "headDim=%d blockSize=%d slotSize=%d\n",
+           blockDim, tiling.gridSize, B, Hq,
+           tiling.headDim, tiling.blockSize, tiling.slotSize);
+    fflush(stdout);
     tq_fused_decode_kernel(
         blockDim, nullptr, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
         sl.data_ptr(), ct.data_ptr(), output.data_ptr(),
         tilingTensor.data_ptr());
+    printf("[TQ-HOST] Kernel launch returned (async, may not have completed)\n");
+    fflush(stdout);
 
     return output;
 }

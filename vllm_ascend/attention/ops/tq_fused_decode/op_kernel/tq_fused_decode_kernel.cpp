@@ -167,6 +167,11 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     uint32_t blockIdx = GetBlockIdx();
 
+    // Earliest possible diagnostic: confirms the kernel entry point is reached.
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-INIT-ENTRY block=%d\n", blockIdx);
+    }
+
     // Init UB buffers
     pipe.InitBuffer(slotQueue, 1, SLOT_QUEUE_BUF);
     pipe.InitBuffer(queryBuf, QUERY_BUF_SIZE);
@@ -227,6 +232,12 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     // Initialize online softmax state
     runningMax_ = -3.4e38f;
     runningSum_ = 0.0f;
+
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-INIT-DONE b=%d h=%d grid=%d seq=%d headDim=%d\n",
+                         batchIdx_, qheadIdx_, tiling.gridSize,
+                         seqLen_, tiling.headDim);
+    }
 }
 
 // ---- Score + online softmax + value dequant + accumulate ----
@@ -321,86 +332,46 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
     pipe_barrier(PIPE_V);
 }
 
-// ---- Process: main loop over all KV tokens ----
+// ---- Process: DIAGNOSTIC minimal write test ----
+// Bypasses ALL attention computation. Writes float(blockIdx+1) to every
+// output element. Combined with the -42.0 pre-fill sentinel in the torch
+// extension, this definitively answers whether the kernel runs:
+//   output = -42.0  →  kernel did NOT run (launch failure or Init crash)
+//   output = 1..32  →  kernel runs, output path works (bug is in computation)
 
 __aicore__ inline void KernelTqFusedDecode::Process() {
     if (GetBlockIdx() >= tiling.gridSize) return;
 
-    // BUILD-VERIFICATION: this printf proves the kernel binary was rebuilt.
-    // If you see "TQ-KERNEL-V2" in the logs, the latest source is running.
-    // Only core 0 prints to avoid flooding.
     if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-KERNEL-V2 seqLen=%d b=%d h=%d\n",
-                         seqLen_, batchIdx_, qheadIdx_);
+        AscendC::printf("TQ-DIAG block=%d grid=%d b=%d h=%d seq=%d headDim=%d\n",
+                         GetBlockIdx(), tiling.gridSize,
+                         batchIdx_, qheadIdx_, seqLen_, tiling.headDim);
     }
 
-    // Handle empty sequence
-    if (seqLen_ == 0) {
-        auto accLocal = accBuf.Get<float>();
-        auto slotOut = slotQueue.AllocTensor<uint8_t>();
-        auto outFp16 = slotOut.ReinterpretCast<half>();
-        Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
-        pipe_barrier(PIPE_V);
-        uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
-                        + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
-        GlobalTensor<half> outOffsetGm;
-        outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
-        DataCopy(outOffsetGm, outFp16, tiling.headDim);
-        PipeBarrier<PIPE_ALL>();
-        slotQueue.FreeTensor(slotOut);
-        return;
-    }
-
-    // Allocate slot buffer once, reuse for all tokens
-    auto slotLocal = slotQueue.AllocTensor<uint8_t>();
-
-    for (uint32_t tokenPos = 0; tokenPos < seqLen_; tokenPos++) {
-        // Paged address computation
-        uint32_t virtualBlock = tokenPos / tiling.blockSize;
-        uint32_t offsetInBlock = tokenPos % tiling.blockSize;
-        uint32_t physicalBlock = static_cast<uint32_t>(
-            blockTableGm.GetValue(
-                static_cast<int64_t>(batchIdx_) * tiling.maxBlocksPerSeq + virtualBlock));
-
-        uint64_t slotAddr = static_cast<uint64_t>(physicalBlock) * tiling.blockStride
-                          + static_cast<uint64_t>(offsetInBlock) * tiling.slotStride
-                          + static_cast<uint64_t>(kvHead_) * tiling.slotSize;
-
-        // Read slot data (aligned size for DataCopy)
-        GlobalTensor<uint8_t> kvSlotGm;
-        kvSlotGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCacheBase_) + slotAddr);
-        DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
-        PipeBarrier<PIPE_ALL>();
-
-        ComputeScoreAndAccumulate(slotLocal);
-    }
-
-    // Final normalization: output = acc / runningSum
+    // Write blockIdx+1 as a float to every output element.
+    // Head 0 → all 1.0, head 1 → all 2.0, ..., head 31 → all 32.0.
     auto accLocal = accBuf.Get<float>();
-    float invSum = 1.0f / runningSum_;
-    Muls(accLocal, accLocal, invSum, tiling.headDim);
+    float val = static_cast<float>(GetBlockIdx() + 1);
+    Duplicate(accLocal, val, HEAD_DIM);
     pipe_barrier(PIPE_V);
 
-    // BUILD-VERIFICATION (temporary): multiply output by 2.0 so the
-    // kernel binary leaves a fingerprint on every output element.
-    // If the kernel .so was actually rebuilt with this source, the
-    // fused diagnostic output should show ±2.859375 instead of ±1.4296875.
-    // If you still see ±1.4296875, the binary on disk is stale and the
-    // deploy script's rebuild step did not pick up these source changes.
-    Muls(accLocal, accLocal, 2.0f, tiling.headDim);
-    pipe_barrier(PIPE_V);
-
-    // Cast fp32 → fp16 and write output
+    auto slotLocal = slotQueue.AllocTensor<uint8_t>();
     auto outFp16 = slotLocal.ReinterpretCast<half>();
-    Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
+    Cast(outFp16, accLocal, RoundMode::CAST_ROUND, HEAD_DIM);
     pipe_barrier(PIPE_V);
 
     uint64_t outOff = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                     + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
     GlobalTensor<half> outOffsetGm;
     outOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(outputBase_) + outOff);
-    DataCopy(outOffsetGm, outFp16, tiling.headDim);
+    DataCopy(outOffsetGm, outFp16, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
+
+    if (GetBlockIdx() == 0) {
+        AscendC::printf("TQ-DIAG-DONE block=%d wrote val=%f\n",
+                         GetBlockIdx(), val);
+    }
+
     slotQueue.FreeTensor(slotLocal);
 }
 

@@ -553,6 +553,15 @@ def _log_decode_diff(
             f"(count={unique_vals.numel()})"
         )
 
+    # Kernel launch diagnostic: check for the -42.0 sentinel and blockIdx values.
+    if n <= 3:
+        fused_all = out_fused.detach().cpu().float()
+        all_unique = torch.unique(fused_all)
+        _tq_diag_log(
+            f"  KERNEL-LAUNCH-CHECK: fused all-heads unique="
+            f"{all_unique.tolist()[:32]} (count={all_unique.numel()})"
+        )
+
 
 def npu_turboquant_decode_attention(
     query: torch.Tensor,
