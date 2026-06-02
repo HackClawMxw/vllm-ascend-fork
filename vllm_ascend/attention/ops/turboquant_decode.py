@@ -52,6 +52,28 @@ except Exception as e:
     print(f"[TQ] Failed to load fused decode kernel: {e}")
 
 
+# ============================================================================
+# Diagnostic configuration (env-controlled)
+# ============================================================================
+# TQ_DIAG_DUAL_PATH=1 (default): run BOTH fused kernel and Python fallback,
+#   log max absolute difference, return fallback for correctness.
+#   Set to 0 to use fused-only (original behavior, may produce garbled output).
+# TQ_DIAG_LOG_LIMIT=N: only log first N decode calls per process (default 30).
+#   Further calls still run both paths (for correctness) but stop printing.
+# TQ_DIAG_DIFF_THRESHOLD: log "GARBLED" if max_diff > threshold (default 1e-2).
+_TQ_DIAG_DUAL_PATH = os.environ.get("TQ_DIAG_DUAL_PATH", "1") not in ("0", "false", "False")
+_TQ_DIAG_LOG_LIMIT = int(os.environ.get("TQ_DIAG_LOG_LIMIT", "30"))
+_TQ_DIAG_DIFF_THRESHOLD = float(os.environ.get("TQ_DIAG_DIFF_THRESHOLD", "1e-2"))
+
+# Per-process diagnostic state (initialized lazily inside the call path)
+_TQ_DIAG_STATE = {"count": 0, "garbled_count": 0, "max_diff_seen": 0.0}
+
+
+def _tq_diag_log(*args, **kwargs):
+    """Always-flushed print so logs survive a server crash."""
+    print(*args, **kwargs, flush=True)
+
+
 def _unpack_mse_key(
     slot_data: torch.Tensor,
     centroids: torch.Tensor,
@@ -318,6 +340,197 @@ def _gather_and_dequant_kv(
     return key, value
 
 
+def _decode_fallback_impl(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    scale: float,
+    key_fp8: bool,
+    mse_bits: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    head_dim: int,
+    num_kv_heads: int,
+    num_heads: int,
+    centroids: torch.Tensor,
+    norm_correction: bool,
+    target_dtype: torch.dtype,
+    key_lut: torch.Tensor | None,
+    val_idx_lut: torch.Tensor | None,
+) -> torch.Tensor:
+    """Python dequant + npu_fused_infer_attention_score decode path.
+
+    Extracted as a standalone helper so the dual-path diagnostic can call it
+    alongside the fused kernel without duplicating logic.
+    """
+    B = block_table.shape[0]
+    D = head_dim
+    block_size = kv_cache.shape[1]
+    slot_size = kv_cache.shape[3]
+    device = query.device
+
+    mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
+    val_data_bytes = math.ceil(D * value_quant_bits / 8)
+
+    active_ids = []
+    for b in range(B):
+        sl = seq_lens[b]
+        if sl <= 0:
+            continue
+        n_blocks = (sl + block_size - 1) // block_size
+        active_ids.append(block_table[b, :n_blocks])
+
+    if not active_ids:
+        return query.new_zeros(query.shape[0], num_heads, D)
+
+    used_blocks = torch.unique(torch.cat(active_ids))
+    n_used = used_blocks.shape[0]
+
+    all_block_data = kv_cache[used_blocks]
+    flat_data = all_block_data.reshape(-1, slot_size)
+
+    if key_fp8:
+        all_keys = _unpack_fp8_key(flat_data, D)
+    else:
+        all_keys = _unpack_mse_key(
+            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction,
+            key_lut=key_lut,
+        )
+
+    all_values = _unpack_value(
+        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D,
+        val_idx_lut=val_idx_lut,
+    )
+
+    key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
+    value_cache = all_values.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
+
+    max_id = used_blocks.max().item()
+    id_to_idx = torch.full((max_id + 1,), -1, dtype=torch.int32, device=device)
+    id_to_idx[used_blocks] = torch.arange(n_used, dtype=torch.int32, device=device)
+
+    bt_clamped = block_table.clamp(min=0, max=max_id)
+    remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
+
+    # Match standard AscendAttention decode convention:
+    # Q seq_lens are cumulative, KV seq_lens are individual.
+    cum_seq_lens_q = list(range(1, B + 1))
+
+    output, _ = torch_npu.npu_fused_infer_attention_score(
+        query[:B],
+        key_cache,
+        value_cache,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        scale=scale,
+        input_layout="TND",
+        block_table=remapped_bt,
+        block_size=block_size,
+        sparse_mode=0,
+        actual_seq_lengths=cum_seq_lens_q,
+        actual_seq_lengths_kv=seq_lens,
+    )
+    return output
+
+
+def _call_fused_kernel(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: list[int],
+    scale: float,
+    mse_bits: int,
+    key_packed_size: int,
+    value_quant_bits: int,
+    head_dim: int,
+    block_size: int,
+    centroids: torch.Tensor,
+    norm_correction: bool,
+    target_dtype: torch.dtype,
+):
+    """Invoke the fused Ascend C decode kernel and cast to target_dtype."""
+    device = query.device
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    # Kernel expects fp16 query; convert from bf16/fp32 if needed.
+    B = block_table.shape[0]
+    q_in = query[:B].to(torch.float16)
+    out = torch.ops.npu.tq_fused_decode(
+        q_in,
+        kv_cache,
+        block_table,
+        seq_lens_t,
+        centroids.to(torch.float32),
+        sm_scale=scale,
+        mse_bytes=math.ceil(head_dim * mse_bits / 8),
+        key_packed_size=key_packed_size,
+        val_data_bytes=math.ceil(head_dim * value_quant_bits / 8),
+        head_dim=head_dim,
+        block_size=block_size,
+        norm_correction=norm_correction,
+    )
+    return out.to(target_dtype)
+
+
+def _log_decode_diff(
+    out_fused: torch.Tensor,
+    out_fb: torch.Tensor,
+    seq_lens: list[int],
+    head_dim: int,
+    num_heads: int,
+) -> None:
+    """Compare fused vs fallback outputs and log a single summary line.
+
+    Logs are rate-limited by _TQ_DIAG_LOG_LIMIT. After the limit is reached,
+    this function becomes a no-op (the caller still returns the fallback
+    tensor, so correctness is preserved — we just stop spamming logs).
+    """
+    state = _TQ_DIAG_STATE
+    state["count"] += 1
+    n = state["count"]
+    if n > _TQ_DIAG_LOG_LIMIT:
+        return
+
+    # Float diff for stable comparison regardless of target dtype.
+    diff = (out_fused.float() - out_fb.float()).abs()
+    max_diff = float(diff.max().item())
+    mean_diff = float(diff.mean().item())
+    has_nan = bool(torch.isnan(out_fused).any().item() or torch.isinf(out_fused).any().item())
+    has_garbled = max_diff > _TQ_DIAG_DIFF_THRESHOLD or has_nan
+
+    if max_diff > state["max_diff_seen"]:
+        state["max_diff_seen"] = max_diff
+    if has_garbled:
+        state["garbled_count"] += 1
+
+    # Locate the worst element: (batch, head, dim)
+    flat_idx = int(diff.argmax().item())
+    total_per_batch = num_heads * head_dim
+    b_bad = flat_idx // total_per_batch
+    h_bad = (flat_idx % total_per_batch) // head_dim
+    d_bad = (flat_idx % total_per_batch) % head_dim
+
+    seq_lens_str = ",".join(str(x) for x in seq_lens[:min(8, len(seq_lens))])
+    if len(seq_lens) > 8:
+        seq_lens_str += f",...(+{len(seq_lens) - 8})"
+
+    tag = "GARBLED" if has_garbled else "ok"
+    _tq_diag_log(
+        f"[TQ-DIAG #{n}] {tag} max_diff={max_diff:.4e} mean={mean_diff:.4e} "
+        f"B={out_fused.shape[0]} seq=[{seq_lens_str}] "
+        f"worst@(b={b_bad},h={h_bad},d={d_bad}) "
+        f"nan/inf={'yes' if has_nan else 'no'} "
+        f"running(garbled={state['garbled_count']}/{n}, peak={state['max_diff_seen']:.4e})"
+    )
+
+    if has_garbled and n <= 5:
+        # Show the first head's first 8 dims so we can see bit-pattern corruption.
+        fused_sample = out_fused[0, 0, :8].detach().cpu().float().tolist()
+        fb_sample = out_fb[0, 0, :8].detach().cpu().float().tolist()
+        _tq_diag_log(f"  fused[0,0,:8]    = {[f'{v:+.3e}' for v in fused_sample]}")
+        _tq_diag_log(f"  fallback[0,0,:8] = {[f'{v:+.3e}' for v in fb_sample]}")
+
+
 def npu_turboquant_decode_attention(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -339,131 +552,73 @@ def npu_turboquant_decode_attention(
     key_lut: torch.Tensor | None = None,
     val_idx_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Decode attention for TurboQuant on NPU (vectorized).
+    """Decode attention for TurboQuant on NPU.
 
-    Gathers all used cache blocks in a single tensor, batch-dequantizes
-    all keys and values, then runs paged attention via
-    npu_fused_infer_attention_score.
+    Three execution modes (controlled by env vars at import time):
 
-    Keys are dequantized in Hadamard-rotated space. The caller must
-    pre-rotate the query via ``query = query @ Pi`` before calling.
-
-    Returns:
-        output: (num_decode_tokens, Hq, D) in target_dtype.
+    1. Fused kernel unavailable (or wrong dtype): runs Python fallback only.
+    2. Fused kernel available, TQ_DIAG_DUAL_PATH=1 (default):
+       runs BOTH fused kernel and Python fallback, logs max_diff,
+       returns fallback for safety. Use this to diagnose garbled output.
+    3. Fused kernel available, TQ_DIAG_DUAL_PATH=0:
+       runs fused kernel only (original behavior).
     """
     B = block_table.shape[0]
     D = head_dim
     block_size = kv_cache.shape[1]
-    slot_size = kv_cache.shape[3]
     device = query.device
 
-    # Fast path: use fused Ascend C kernel (single kernel launch)
-    if _tq_fused_decode_loaded and not key_fp8 and mse_bits == 4:
-        seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        # Kernel expects fp16 query; convert from bf16 if needed
-        q_in = query[:B].to(torch.float16)
-        out = torch.ops.npu.tq_fused_decode(
-            q_in,
-            kv_cache,
-            block_table,
-            seq_lens_t,
-            centroids.to(torch.float32),
-            sm_scale=scale,
-            mse_bytes=math.ceil(D * mse_bits / 8),
-            key_packed_size=key_packed_size,
-            val_data_bytes=math.ceil(D * value_quant_bits / 8),
-            head_dim=D,
-            block_size=block_size,
-            norm_correction=norm_correction,
-        )
-        return out.to(query.dtype)
+    fused_eligible = _tq_fused_decode_loaded and not key_fp8 and mse_bits == 4
 
-    # Diagnostic: why fused kernel was not used (print once)
-    if not hasattr(npu_turboquant_decode_attention, '_diag_printed'):
-        npu_turboquant_decode_attention._diag_printed = True
-        reasons = []
-        if not _tq_fused_decode_loaded:
-            reasons.append("kernel not loaded")
-        if key_fp8:
-            reasons.append("key_fp8=True")
-        if mse_bits != 4:
-            reasons.append(f"mse_bits={mse_bits} (!=4)")
-        print(f"[TQ] Using Python fallback decode path. Reasons: {', '.join(reasons)}")
-
-    # Fallback: original Python dequant + FIA path
-    mse_bytes = math.ceil(D * mse_bits / 8) if not key_fp8 else 0
-    val_data_bytes = math.ceil(D * value_quant_bits / 8)
-
-    # Collect unique block IDs referenced by active sequences
-    active_ids = []
-    for b in range(B):
-        sl = seq_lens[b]
-        if sl <= 0:
-            continue
-        n_blocks = (sl + block_size - 1) // block_size
-        active_ids.append(block_table[b, :n_blocks])
-
-    if not active_ids:
-        return query.new_zeros(query.shape[0], num_heads, D)
-
-    used_blocks = torch.unique(torch.cat(active_ids))
-    n_used = used_blocks.shape[0]
-
-    # Gather all used blocks at once: (n_used, block_size, Hk, slot_size)
-    all_block_data = kv_cache[used_blocks]
-
-    # Flatten to (n_used * block_size * Hk, slot_size) for batch unpacking
-    flat_data = all_block_data.reshape(-1, slot_size)
-
-    # Vectorized key dequantization
-    if key_fp8:
-        all_keys = _unpack_fp8_key(flat_data, D)
-    else:
-        all_keys = _unpack_mse_key(
-            flat_data, centroids, mse_bits, mse_bytes, D, norm_correction,
-            key_lut=key_lut,
+    # One-time reason log when fused kernel is not being used at all.
+    if not fused_eligible:
+        if not getattr(npu_turboquant_decode_attention, "_diag_printed", False):
+            npu_turboquant_decode_attention._diag_printed = True
+            reasons = []
+            if not _tq_fused_decode_loaded:
+                reasons.append("kernel not loaded")
+            if key_fp8:
+                reasons.append("key_fp8=True")
+            if mse_bits != 4:
+                reasons.append(f"mse_bits={mse_bits} (!=4)")
+            _tq_diag_log(
+                f"[TQ] Fallback-only mode. Reasons: {', '.join(reasons)}; "
+                f"dual_path_diag={_TQ_DIAG_DUAL_PATH} (inactive)"
+            )
+        return _decode_fallback_impl(
+            query, kv_cache, block_table, seq_lens, scale,
+            key_fp8, mse_bits, key_packed_size, value_quant_bits,
+            head_dim, num_kv_heads, num_heads, centroids, norm_correction,
+            target_dtype, key_lut, val_idx_lut,
         )
 
-    # Vectorized value dequantization
-    all_values = _unpack_value(
-        flat_data, key_packed_size, value_quant_bits, val_data_bytes, D,
-        val_idx_lut=val_idx_lut,
+    # Fused kernel is eligible. Decide between dual-path diagnostic and fast path.
+    if _TQ_DIAG_DUAL_PATH:
+        # Run both paths and compare. The fused result is throwaway for
+        # correctness (we return fallback), but the diff tells us exactly
+        # where and how badly the kernel diverges.
+        out_fused = _call_fused_kernel(
+            query, kv_cache, block_table, seq_lens, scale,
+            mse_bits, key_packed_size, value_quant_bits,
+            D, block_size, centroids, norm_correction,
+            target_dtype,
+        )
+        out_fb = _decode_fallback_impl(
+            query, kv_cache, block_table, seq_lens, scale,
+            key_fp8, mse_bits, key_packed_size, value_quant_bits,
+            head_dim, num_kv_heads, num_heads, centroids, norm_correction,
+            target_dtype, key_lut, val_idx_lut,
+        )
+        _log_decode_diff(out_fused, out_fb, seq_lens, head_dim=D, num_heads=num_heads)
+        return out_fb
+
+    # Pure fused path (original behavior — used after the kernel is fixed).
+    return _call_fused_kernel(
+        query, kv_cache, block_table, seq_lens, scale,
+        mse_bits, key_packed_size, value_quant_bits,
+        D, block_size, centroids, norm_correction,
+        target_dtype,
     )
-
-    # Reshape to paged cache format: (n_used, block_size, Hk * D)
-    key_cache = all_keys.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
-    value_cache = all_values.reshape(n_used, block_size, num_kv_heads * D).to(target_dtype)
-
-    # Build reverse mapping: original block_id -> index in partial cache
-    max_id = used_blocks.max().item()
-    id_to_idx = torch.full((max_id + 1,), -1, dtype=torch.int32, device=device)
-    id_to_idx[used_blocks] = torch.arange(n_used, dtype=torch.int32, device=device)
-
-    # Remap block_table: original block IDs -> partial cache indices
-    bt_clamped = block_table.clamp(min=0, max=max_id)
-    remapped_bt = id_to_idx[bt_clamped].clamp(min=0).to(block_table.dtype)
-
-    # Paged attention via FIA
-    # Q seq_lens must be cumulative; KV seq_lens are individual
-    # (matching standard AscendAttention decode convention)
-    cum_seq_lens_q = list(range(1, B + 1))
-
-    output, _ = torch_npu.npu_fused_infer_attention_score(
-        query[:B],
-        key_cache,
-        value_cache,
-        num_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        scale=scale,
-        input_layout="TND",
-        block_table=remapped_bt,
-        block_size=block_size,
-        sparse_mode=0,
-        actual_seq_lengths=cum_seq_lens_q,
-        actual_seq_lengths_kv=seq_lens,
-    )
-
-    return output
 
 
 def npu_turboquant_full_dequant_kv(
