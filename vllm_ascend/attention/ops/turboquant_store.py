@@ -103,6 +103,14 @@ def _scatter_to_cache(
     valid_heads = head_indices[valid_mask]
     valid_data = slot_data[valid_mask]
 
+    # Pad slot_data to match cache's aligned slot size if needed
+    cache_slot_size = kv_cache.shape[-1]
+    data_slot_size = valid_data.shape[-1]
+    if data_slot_size < cache_slot_size:
+        padding = torch.zeros(valid_data.shape[0], cache_slot_size - data_slot_size,
+                              dtype=valid_data.dtype, device=valid_data.device)
+        valid_data = torch.cat([valid_data, padding], dim=-1)
+
     block_indices = valid_slots // block_size
     pos_indices = valid_slots % block_size
 
