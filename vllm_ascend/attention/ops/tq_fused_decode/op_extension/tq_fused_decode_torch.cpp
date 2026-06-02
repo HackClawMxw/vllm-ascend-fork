@@ -7,10 +7,10 @@
 #include <cstdint>
 #include <cstdio>
 
-// Kernel entry declared with __global__ __aicore__ in .asc file.
-// When compiled into the shared library, it becomes a C-linkage function
-// with signature: (blockDim, l2Ctrl, stream, ...gm_args...)
-extern "C" void tq_fused_decode_kernel(
+// The CCE compiler generates tq_fused_decode_kernel as an empty stub (single ret
+// instruction). The ACTUAL launch function is aclrtlaunch_tq_fused_decode_kernel,
+// which packages arguments into void*[] and calls rtKernelLaunchWithHandle.
+extern "C" void aclrtlaunch_tq_fused_decode_kernel(
     uint32_t blockDim, void* l2Ctrl, aclrtStream stream,
     void* queryRot, void* kvCache, void* blockTable,
     void* seqLens, void* centroids, void* output, void* tiling);
@@ -87,12 +87,12 @@ torch::Tensor tq_fused_decode_torch(
            tiling.headDim, tiling.blockSize, tiling.slotSize,
            (void*)aclStream);
     fflush(stdout);
-    tq_fused_decode_kernel(
+    aclrtlaunch_tq_fused_decode_kernel(
         blockDim, nullptr, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
         sl.data_ptr(), ct.data_ptr(), output.data_ptr(),
         tilingTensor.data_ptr());
-    printf("[TQ-HOST] Kernel stub returned\n");
+    printf("[TQ-HOST] aclrtlaunch returned\n");
     fflush(stdout);
 
     // Synchronize to force kernel completion and capture device-side errors.
