@@ -32,20 +32,35 @@ torch::Tensor tq_fused_decode_torch(
     bool norm_correction) {
     auto q = query_rot.contiguous();
     auto kv = kv_cache.contiguous();
-    auto bt = block_table.contiguous();
-    auto sl = seq_lens.contiguous();
-    auto ct = centroids.contiguous();
+    // Ensure correct device + dtype: kernel reads block_table/seq_lens as int32,
+    // centroids as float32. Guard against host-side int64 or CPU tensors that
+    // would cause MTE "DDR address out of range" (error 507057).
+    auto bt = block_table.contiguous().to(q.device(), at::kInt);
+    auto sl = seq_lens.contiguous().to(q.device(), at::kInt);
+    auto ct = centroids.contiguous().to(q.device(), at::kFloat);
 
-    // Diagnostics: verify all tensors are on NPU with expected shapes
-    printf("[TQ-HOST] q: dev=%d shape=[%ld,%ld,%ld] ptr=%p\n",
+    // Diagnostics: verify all tensors are on NPU with expected shapes/dtypes
+    printf("[TQ-HOST] q: dev=%d dtype=%d shape=[%ld,%ld,%ld] ptr=%p\n",
            static_cast<int>(q.device().type()),
+           static_cast<int>(q.scalar_type()),
            q.size(0), q.size(1), q.size(2), q.data_ptr());
-    printf("[TQ-HOST] kv: dev=%d shape=[%ld,%ld,%ld,%ld] ptr=%p\n",
+    printf("[TQ-HOST] kv: dev=%d dtype=%d shape=[%ld,%ld,%ld,%ld] ptr=%p total=%ldB\n",
            static_cast<int>(kv.device().type()),
-           kv.size(0), kv.size(1), kv.size(2), kv.size(3), kv.data_ptr());
-    printf("[TQ-HOST] ct: dev=%d numel=%ld ptr=%p\n",
+           static_cast<int>(kv.scalar_type()),
+           kv.size(0), kv.size(1), kv.size(2), kv.size(3), kv.data_ptr(),
+           kv.numel() * kv.element_size());
+    printf("[TQ-HOST] ct: dev=%d dtype=%d numel=%ld ptr=%p\n",
            static_cast<int>(ct.device().type()),
+           static_cast<int>(ct.scalar_type()),
            ct.numel(), ct.data_ptr());
+    printf("[TQ-HOST] sl: dev=%d dtype=%d numel=%ld ptr=%p\n",
+           static_cast<int>(sl.device().type()),
+           static_cast<int>(sl.scalar_type()),
+           sl.numel(), sl.data_ptr());
+    printf("[TQ-HOST] bt: dev=%d dtype=%d shape=[%ld,%ld] ptr=%p\n",
+           static_cast<int>(bt.device().type()),
+           static_cast<int>(bt.scalar_type()),
+           bt.size(0), bt.size(1), bt.data_ptr());
     fflush(stdout);
 
     int64_t B = q.size(0);
@@ -98,10 +113,12 @@ torch::Tensor tq_fused_decode_torch(
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
     printf("[TQ-HOST] Launching kernel blockDim=%d gridSize=%d B=%ld Hq=%ld "
-           "headDim=%d blockSize=%d slotSize=%d stream=%p\n",
-           blockDim, tiling.gridSize, B, Hq,
+           "Hk=%ld headDim=%d blockSize=%d slotSize=%d "
+           "blockStride=%lu slotStride=%lu maxBlocks=%ld stream=%p\n",
+           blockDim, tiling.gridSize, B, Hq, Hk,
            tiling.headDim, tiling.blockSize, tiling.slotSize,
-           (void*)aclStream);
+           (unsigned long)tiling.blockStride, (unsigned long)tiling.slotStride,
+           max_blocks, (void*)aclStream);
     fflush(stdout);
     aclrtlaunch_tq_fused_decode_kernel(
         blockDim, nullptr, aclStream,
