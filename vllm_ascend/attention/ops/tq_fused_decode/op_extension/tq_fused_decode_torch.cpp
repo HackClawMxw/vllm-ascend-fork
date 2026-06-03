@@ -30,7 +30,8 @@ torch::Tensor tq_fused_decode_torch(
     int64_t head_dim,
     int64_t block_size,
     bool norm_correction) {
-    auto q = query_rot.contiguous();
+    // Kernel reads query as half (fp16). Caller may pass float32.
+    auto q = query_rot.contiguous().to(at::kHalf);
     auto kv = kv_cache.contiguous();
     // Ensure correct device + dtype: kernel reads block_table/seq_lens as int32,
     // centroids as float32. Guard against host-side int64 or CPU tensors that
@@ -102,14 +103,23 @@ torch::Tensor tq_fused_decode_torch(
     uint32_t blockDim = tiling.gridSize;
     if (blockDim == 0) blockDim = 1;
 
-    // Copy tiling to device via temporary tensor.
-    // The kernel's DataCopy reads TILING_BUF_ALIGNED bytes (ceil to 32-byte),
-    // so the device buffer must be at least that large to avoid MTE overread.
+    // Copy tiling to device as int32 tensor.
+    // Previous approach (at::from_blob + at::kByte + .to(device)) produced garbage
+    // on NPU — torch_npu may not reliably transfer uint8 blobs H2D.
+    // Using int32 ensures a well-supported dtype for the H2D copy.
     constexpr int64_t kTilingBufAligned =
-        ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;
-    auto tilingTensor = at::from_blob(
-        &tiling, {kTilingBufAligned},
-        at::kByte).to(q.device()).clone();
+        ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;  // = 96
+    constexpr int64_t kTilingInt32Len = kTilingBufAligned / sizeof(int32_t); // = 24
+    auto cpuTiling = torch::empty({kTilingInt32Len}, at::kInt);
+    memcpy(cpuTiling.data_ptr<int32_t>(), &tiling, sizeof(tiling));
+    auto tilingTensor = cpuTiling.to(q.device());
+
+    // Verify tiling bytes before launch
+    printf("[TQ-HOST] tiling hex:");
+    auto* tp = cpuTiling.data_ptr<int32_t>();
+    for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(tp[i]));
+    printf(" ... ptr=%p\n", tilingTensor.data_ptr());
+    fflush(stdout);
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
     printf("[TQ-HOST] Launching kernel blockDim=%d gridSize=%d B=%ld Hq=%ld "

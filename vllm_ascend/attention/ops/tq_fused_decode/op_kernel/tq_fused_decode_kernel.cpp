@@ -120,37 +120,44 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 // ---- Tiling data read via DataCopy + GetValue ----
 
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
-    GlobalTensor<uint8_t> tilingGm;
-    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(tilingData));
-    auto slotLocal = slotQueue.AllocTensor<uint8_t>();
-    // Copy aligned size (DataCopy requires 32-byte alignment)
-    DataCopy(slotLocal, tilingGm, TILING_BUF_ALIGNED);
+    GlobalTensor<int32_t> tilingGm;
+    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tilingData));
+    auto slotLocal = slotQueue.AllocTensor<int32_t>();
+    // Copy as int32 array (host transfers as int32 for reliable H2D copy).
+    // TILING_BUF_ALIGNED bytes / 4 bytes per int32 = 24 elements.
+    // 24 * 4 = 96 bytes, which is 3 * 32 — satisfies 32-byte alignment.
+    constexpr uint32_t kTilingInt32Count = TILING_BUF_ALIGNED / sizeof(int32_t);
+    DataCopy(slotLocal, tilingGm, kTilingInt32Count);
     // DataCopy is async DMA on MTE2 pipe; must wait before reading UB.
-    // pipe_barrier(PIPE_V) only synchronizes the V pipe, not MTE2.
     PipeBarrier<PIPE_ALL>();
 
-    auto s = slotLocal.ReinterpretCast<int32_t>();
+    if (GetBlockIdx() == 0) {
+        AscendC::printf("TQ-RAW-TILING: %d %d %d %d %d %d\n",
+                         slotLocal.GetValue(0), slotLocal.GetValue(1),
+                         slotLocal.GetValue(2), slotLocal.GetValue(3),
+                         slotLocal.GetValue(4), slotLocal.GetValue(5));
+    }
 
-    tiling.batchSize       = s.GetValue(0);
-    tiling.numQueryHeads   = s.GetValue(1);
-    tiling.numKvHeads      = s.GetValue(2);
-    tiling.gqaRatio        = s.GetValue(3);
-    tiling.gridSize        = s.GetValue(4);
-    tiling.blockSize       = s.GetValue(5);
-    tiling.headDim         = s.GetValue(6);
-    tiling.mseBytes        = s.GetValue(7);
-    tiling.keyPackedSize   = s.GetValue(8);
-    tiling.valDataBytes    = s.GetValue(9);
-    tiling.slotSize        = s.GetValue(10);
-    tiling.maxBlocksPerSeq = s.GetValue(11);
-    uint32_t lo12 = s.GetValue(12);
-    uint32_t hi13 = s.GetValue(13);
+    tiling.batchSize       = slotLocal.GetValue(0);
+    tiling.numQueryHeads   = slotLocal.GetValue(1);
+    tiling.numKvHeads      = slotLocal.GetValue(2);
+    tiling.gqaRatio        = slotLocal.GetValue(3);
+    tiling.gridSize        = slotLocal.GetValue(4);
+    tiling.blockSize       = slotLocal.GetValue(5);
+    tiling.headDim         = slotLocal.GetValue(6);
+    tiling.mseBytes        = slotLocal.GetValue(7);
+    tiling.keyPackedSize   = slotLocal.GetValue(8);
+    tiling.valDataBytes    = slotLocal.GetValue(9);
+    tiling.slotSize        = slotLocal.GetValue(10);
+    tiling.maxBlocksPerSeq = slotLocal.GetValue(11);
+    uint32_t lo12 = slotLocal.GetValue(12);
+    uint32_t hi13 = slotLocal.GetValue(13);
     tiling.blockStride = (static_cast<uint64_t>(hi13) << 32) | lo12;
-    uint32_t lo14 = s.GetValue(14);
-    uint32_t hi15 = s.GetValue(15);
+    uint32_t lo14 = slotLocal.GetValue(14);
+    uint32_t hi15 = slotLocal.GetValue(15);
     tiling.slotStride = (static_cast<uint64_t>(hi15) << 32) | lo14;
-    tiling.normCorrection  = s.GetValue(16);
-    uint32_t rawScale = s.GetValue(17);
+    tiling.normCorrection  = slotLocal.GetValue(16);
+    uint32_t rawScale = slotLocal.GetValue(17);
     union { uint32_t u; float f; } cvtScale;
     cvtScale.u = rawScale;
     tiling.smScale = cvtScale.f;
