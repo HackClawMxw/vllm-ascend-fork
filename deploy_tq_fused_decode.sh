@@ -96,6 +96,117 @@ if [ "$SKIP_KERNEL" = false ]; then
     sudo docker cp ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/op_extension \
         ${CONTAINER}:${SITE}/attention/ops/tq_fused_decode/
 
+    # ========== Patch CANN build toolchain ==========
+    # CANN 8.5.x has bugs when building for ascend910b1/ascend910b4 targets:
+    #   Bug 1: merge_obj_text.sh feeds GCC ELF to AICore linker → "unknown file type"
+    #   Bug 2: merge_mix_obj.sh --build-type with empty value → infinite loop + wrong ld.lld args
+    #   Bug 3: merge_obj.sh creates output/name/name (dir) but ascendc_pack_kernel expects a file
+    echo "=== Patching CANN build toolchain ==="
+
+    # Write fixed merge_mix_obj.sh to host temp file (single-quoted heredoc preserves $)
+    cat > /tmp/cann_merge_mix_obj_fix.sh << 'MERGE_FIX_EOF'
+#!/bin/bash
+# Fixed merge_mix_obj.sh for CANN 8.5.x ascend910b1/ascend910b4 build.
+current_dir=$(dirname $(readlink -f ${BASH_SOURCE[0]}))
+
+linker=""
+output=""
+build_type=""
+aiv_dir=""
+aic_dir=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -l | --linker)
+        linker="$2"; shift 2 || shift 1 ;;
+    -o | --output)
+        output="$2"; shift 2 || shift 1 ;;
+    --aic-dir)
+        aic_dir="$2"; shift 2 || shift 1 ;;
+    --aiv-dir)
+        aiv_dir="$2"; shift 2 || shift 1 ;;
+    --build-type)
+        if [[ -n "$2" && ! "$2" =~ ^- ]]; then
+            build_type="$2"; shift 2
+        else
+            shift 1
+        fi
+        ;;
+    *)
+        break
+        ;;
+    esac
+done
+
+mix_build_flag=mix_build.flag
+aic_build_flag=aic_build.flag
+aiv_build_flag=aiv_build.flag
+
+if [ ! -d "${output}" ]; then
+    mkdir -p ${output}
+fi
+
+rm -f ${output}/${mix_build_flag} ${output}/${aic_build_flag} ${output}/${aiv_build_flag}
+
+# Build merge_obj.sh args — omit -t when build_type is empty to avoid arg shift
+merge_args="-l ${linker} -o ${output}"
+if [[ -n "${build_type}" ]]; then
+    merge_args="${merge_args} -t ${build_type}"
+fi
+
+# merge_obj.sh creates output/name/name (directory), but ascendc_pack_kernel
+# expects output/name to be a FILE. Flatten after each call.
+flatten_obj() {
+    local name=$1
+    if [[ -d "${output}/${name}" ]]; then
+        mv "${output}/${name}/${name}" "${output}/.${name}.tmp"
+        rm -rf "${output}/${name}"
+        mv "${output}/.${name}.tmp" "${output}/${name}"
+    fi
+}
+
+# mix mode
+if [ -f "${aic_dir}/${mix_build_flag}" ] && [ -f "${aiv_dir}/${mix_build_flag}" ]; then
+    bash ${current_dir}/merge_obj.sh ${merge_args} -n device.o -m ${aic_dir}/device.o ${aiv_dir}/device.o
+    flatten_obj device.o
+    touch ${output}/${mix_build_flag}
+fi
+
+# aic mode
+if [ -f "${aic_dir}/${aic_build_flag}" ]; then
+    bash ${current_dir}/merge_obj.sh ${merge_args} -n device_aic.o -m ${aic_dir}/device_aic.o
+    flatten_obj device_aic.o
+    touch ${output}/${aic_build_flag}
+fi
+
+# aiv mode
+if [ -f "${aiv_dir}/${aiv_build_flag}" ]; then
+    bash ${current_dir}/merge_obj.sh ${merge_args} -n device_aiv.o -m ${aiv_dir}/device_aiv.o
+    flatten_obj device_aiv.o
+    touch ${output}/${aiv_build_flag}
+fi
+MERGE_FIX_EOF
+
+    # Detect CANN util directory inside container
+    CANN_UTIL=$(sudo docker exec ${CONTAINER} bash -c \
+        "find /usr/local/Ascend -path '*/ascendc_kernel_cmake/legacy_modules/util' -type d 2>/dev/null | head -1")
+    if [ -z "${CANN_UTIL}" ]; then
+        echo "ERROR: Cannot find CANN util directory in container"
+        exit 1
+    fi
+    echo "CANN util dir: ${CANN_UTIL}"
+
+    # Patch 1: merge_obj_text.sh — skip entirely (incorrectly feeds GCC ELF to AICore linker)
+    sudo docker exec ${CONTAINER} bash -c "grep -q '^exit 0' '${CANN_UTIL}/merge_obj_text.sh' || sed -i '1i exit 0' '${CANN_UTIL}/merge_obj_text.sh'"
+
+    # Patch 2: merge_mix_obj.sh — full replacement (see bug list above)
+    sudo docker cp /tmp/cann_merge_mix_obj_fix.sh ${CONTAINER}:${CANN_UTIL}/merge_mix_obj.sh
+    sudo docker exec ${CONTAINER} chmod +x ${CANN_UTIL}/merge_mix_obj.sh
+    rm -f /tmp/cann_merge_mix_obj_fix.sh
+
+    echo "=== CANN toolchain patches applied ==="
+
+    # ========== Build ==========
     echo "=== Building Ascend C operator (SOC_VERSION=${SOC_VERSION}) ==="
     sudo docker exec ${CONTAINER} bash -c "
 set -e
@@ -108,7 +219,8 @@ cmake .. \
     2>&1 | tee cmake.log
 make -j\$(nproc 2>/dev/null || echo 4) 2>&1 | tee make.log
 echo '=== Build artifacts ==='
-ls -la *.so 2>/dev/null || echo 'No .so files found!'
+ls -la *.so 2>/dev/null || echo 'No .so files found in build root'
+ls -la lib/*.so 2>/dev/null || echo 'No .so files found in lib/'
 "
 
     # Verify
