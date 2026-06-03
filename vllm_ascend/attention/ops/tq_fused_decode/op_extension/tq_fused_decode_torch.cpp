@@ -75,9 +75,13 @@ torch::Tensor tq_fused_decode_torch(
     uint32_t blockDim = tiling.gridSize;
     if (blockDim == 0) blockDim = 1;
 
-    // Copy tiling to device via temporary tensor
+    // Copy tiling to device via temporary tensor.
+    // The kernel's DataCopy reads TILING_BUF_ALIGNED bytes (ceil to 32-byte),
+    // so the device buffer must be at least that large to avoid MTE overread.
+    constexpr int64_t kTilingBufAligned =
+        ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;
     auto tilingTensor = at::from_blob(
-        &tiling, {static_cast<int64_t>(sizeof(TqFusedDecodeTilingData))},
+        &tiling, {kTilingBufAligned},
         at::kByte).to(q.device()).clone();
 
     // Launch kernel via direct C function call (not <<<>>> syntax)

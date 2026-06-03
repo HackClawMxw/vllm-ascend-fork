@@ -181,7 +181,14 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     pipe.InitBuffer(weightedBuf, WEIGHTED_BUF_SIZE);
 
     // Read tiling data
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-PRE-TILING block=%d\n", blockIdx);
+    }
     ReadTiling(tilingData);
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-POST-TILING grid=%d B=%d Hq=%d\n",
+                         tiling.gridSize, tiling.batchSize, tiling.numQueryHeads);
+    }
 
     // Early exit if this core has no work
     if (blockIdx >= tiling.gridSize) return;
