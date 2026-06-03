@@ -29,8 +29,7 @@ class KernelTqFusedDecode {
 public:
     __aicore__ inline void Init(GM_ADDR queryRot, GM_ADDR kvCache,
                                  GM_ADDR blockTable, GM_ADDR seqLens,
-                                 GM_ADDR centroids, GM_ADDR output,
-                                 GM_ADDR tilingData);
+                                 GM_ADDR centroidsTiling, GM_ADDR output);
     __aicore__ inline void Process();
 
 private:
@@ -40,7 +39,7 @@ private:
     __aicore__ inline void ComputeScoreAndAccumulate(LocalTensor<uint8_t>& slotUb);
     __aicore__ inline void DequantValueAndAccumulate(LocalTensor<uint8_t>& slotUb,
                                                       float weight);
-    __aicore__ inline void ReadTiling(GM_ADDR tilingData);
+    __aicore__ inline void ReadTiling(GM_ADDR centroidsTiling);
 
     TPipe pipe;
 
@@ -118,34 +117,25 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 }
 
 // ---- Tiling data read via DataCopy + GetValue ----
+// Tiling is packed at byte offset kCentroidBytes (64) in the combined buffer.
 
-__aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
+__aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR centroidsTiling) {
+    constexpr uint32_t kCentroidBytes = 16 * sizeof(float);  // 64
+    // Point to tiling data: centroidsTiling + 64 bytes
+    __gm__ uint8_t* tilingBase = reinterpret_cast<__gm__ uint8_t*>(centroidsTiling) + kCentroidBytes;
     GlobalTensor<int32_t> tilingGm;
-    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tilingData));
-
-    // DIAGNOSTIC: read first 2 values directly from GM (no DataCopy)
-    // to verify the GM address is correct and data is present.
-    if (GetBlockIdx() == 0) {
-        int32_t gm0 = tilingGm.GetValue(0);
-        int32_t gm1 = tilingGm.GetValue(1);
-        int32_t gm4 = tilingGm.GetValue(4);
-        AscendC::printf("TQ-GM-DIRECT: %d %d %d\n", gm0, gm1, gm4);
-    }
+    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tilingBase));
 
     auto slotLocal = slotQueue.AllocTensor<int32_t>();
-    // Copy as int32 array (host transfers as int32 for reliable H2D copy).
-    // TILING_BUF_ALIGNED bytes / 4 bytes per int32 = 24 elements.
-    // 24 * 4 = 96 bytes, which is 3 * 32 — satisfies 32-byte alignment.
-    constexpr uint32_t kTilingInt32Count = TILING_BUF_ALIGNED / sizeof(int32_t);
+    constexpr uint32_t kTilingInt32Count = TILING_BUF_ALIGNED / sizeof(int32_t);  // 24
     DataCopy(slotLocal, tilingGm, kTilingInt32Count);
-    // DataCopy is async DMA on MTE2 pipe; must wait before reading UB.
     PipeBarrier<PIPE_ALL>();
 
     if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-UB-AFTER-DC: %d %d %d %d %d %d\n",
+        AscendC::printf("TQ-TILING: B=%d Hq=%d Hk=%d grid=%d bs=%d hd=%d\n",
                          slotLocal.GetValue(0), slotLocal.GetValue(1),
-                         slotLocal.GetValue(2), slotLocal.GetValue(3),
-                         slotLocal.GetValue(4), slotLocal.GetValue(5));
+                         slotLocal.GetValue(2), slotLocal.GetValue(4),
+                         slotLocal.GetValue(5), slotLocal.GetValue(6));
     }
 
     tiling.batchSize       = slotLocal.GetValue(0);
@@ -179,12 +169,10 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
 
 __aicore__ inline void KernelTqFusedDecode::Init(
     GM_ADDR queryRot, GM_ADDR kvCache, GM_ADDR blockTable,
-    GM_ADDR seqLens, GM_ADDR centroids, GM_ADDR output,
-    GM_ADDR tilingData) {
+    GM_ADDR seqLens, GM_ADDR centroidsTiling, GM_ADDR output) {
 
     uint32_t blockIdx = GetBlockIdx();
 
-    // Earliest possible diagnostic: confirms the kernel entry point is reached.
     if (blockIdx == 0) {
         AscendC::printf("TQ-INIT-ENTRY block=%d\n", blockIdx);
     }
@@ -197,11 +185,8 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     pipe.InitBuffer(valBuf, VAL_BUF_SIZE);
     pipe.InitBuffer(weightedBuf, WEIGHTED_BUF_SIZE);
 
-    // Read tiling data
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-PRE-TILING block=%d\n", blockIdx);
-    }
-    ReadTiling(tilingData);
+    // Read tiling from combined buffer (at offset kCentroidBytes=64)
+    ReadTiling(centroidsTiling);
     if (blockIdx == 0) {
         AscendC::printf("TQ-POST-TILING grid=%d B=%d Hq=%d\n",
                          tiling.gridSize, tiling.batchSize, tiling.numQueryHeads);
@@ -214,12 +199,12 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     qheadIdx_ = blockIdx % tiling.numQueryHeads;
     kvHead_ = qheadIdx_ / tiling.gqaRatio;
 
-    // Bind GM tensors
+    // Bind GM tensors (centroids at offset 0 of combined buffer)
     queryRotGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRot));
     kvCacheGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCache));
     blockTableGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(blockTable));
     seqLensGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLens));
-    centroidsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(centroids));
+    centroidsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(centroidsTiling));
     outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output));
 
     // Store raw base addresses for offset-based DataCopy
@@ -230,30 +215,23 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
     if (blockIdx == 0) {
-        AscendC::printf("TQ-PRE-QUERY b=%d h=%d seq=%d qOff=%d\n",
-                         batchIdx_, qheadIdx_, seqLen_,
-                         (int)(batchIdx_ * tiling.numQueryHeads * tiling.headDim
-                              + qheadIdx_ * tiling.headDim));
+        AscendC::printf("TQ-PRE-QUERY b=%d h=%d seq=%d\n",
+                         batchIdx_, qheadIdx_, seqLen_);
     }
 
-    // Load query vector (HEAD_DIM fp16 → fp32 in UB)
+    // Load query vector as float32 directly (torch_npu may pass fp32 query
+    // even when we request fp16 — the .to(kHalf) call is ignored).
     auto queryFp32 = queryBuf.Get<float>();
     uint64_t qOffset = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                      + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
-    GlobalTensor<half> queryOffsetGm;
-    queryOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRotBase_) + qOffset);
-    auto slotForQ = slotQueue.AllocTensor<uint8_t>();
-    auto queryHalfLocal = slotForQ.ReinterpretCast<half>();
-    DataCopy(queryHalfLocal, queryOffsetGm, HEAD_DIM);
+    GlobalTensor<float> queryOffsetGm;
+    queryOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(queryRotBase_) + qOffset);
+    DataCopy(queryFp32, queryOffsetGm, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
 
     if (blockIdx == 0) {
         AscendC::printf("TQ-POST-QUERY\n");
     }
-
-    Cast(queryFp32, queryHalfLocal, RoundMode::CAST_NONE, HEAD_DIM);
-    pipe_barrier(PIPE_V);
-    slotQueue.FreeTensor(slotForQ);
 
     // Load centroid table (16 fp32)
     if (blockIdx == 0) {
@@ -451,9 +429,8 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
 
 extern "C" __global__ __aicore__ void tq_fused_decode_kernel(
     GM_ADDR queryRot, GM_ADDR kvCache, GM_ADDR blockTable,
-    GM_ADDR seqLens, GM_ADDR centroids, GM_ADDR output,
-    GM_ADDR tiling) {
+    GM_ADDR seqLens, GM_ADDR centroidsTiling, GM_ADDR output) {
     KernelTqFusedDecode op;
-    op.Init(queryRot, kvCache, blockTable, seqLens, centroids, output, tiling);
+    op.Init(queryRot, kvCache, blockTable, seqLens, centroidsTiling, output);
     op.Process();
 }
