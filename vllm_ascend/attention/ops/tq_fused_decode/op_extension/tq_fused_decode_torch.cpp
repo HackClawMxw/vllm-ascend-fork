@@ -12,9 +12,9 @@
 // CCE-generated wrapper did not reliably pass a 7th argument (the tiling
 // data arrived as garbage 0xD160D160 on device).
 //
-// Workaround: tiling data is packed after centroids in a combined buffer.
-// Layout: [centroids: 16 float32 = 64B] [tiling: 24 int32 = 96B] = 160B total.
-// The kernel reads centroids from offset 0 and tiling from offset 64.
+// Workaround: tiling data is packed into a combined buffer with centroids.
+// Layout: [tiling: 24 int32 = 96B] [centroids: 16 float32 = 64B] = 160B total.
+// The kernel reads tiling from offset 0 and centroids from offset 96 (float[24]).
 extern "C" void aclrtlaunch_tq_fused_decode_kernel(
     uint32_t blockDim, void* l2Ctrl, aclrtStream stream,
     void* queryRot, void* kvCache, void* blockTable,
@@ -24,6 +24,9 @@ namespace ascend_kernel {
 
 // Centroids: 16 float32 = 64 bytes. Must match CENTROID_TABLE_SIZE in kernel.
 constexpr int64_t kCentroidBytes = 16 * sizeof(float);  // 64
+// Tiling: 72 bytes struct, padded to 96 for 32-byte alignment.
+constexpr int64_t kTilingBufAligned =
+    ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;  // 96
 
 torch::Tensor tq_fused_decode_torch(
     const torch::Tensor& query_rot,
@@ -66,22 +69,21 @@ torch::Tensor tq_fused_decode_torch(
     uint32_t blockDim = tiling.gridSize;
     if (blockDim == 0) blockDim = 1;
 
-    // ---- Build combined centroids+tiling buffer ----
-    // Layout: [centroids: 16 float32 = 64B] [tiling: ceil72to32 = 96B] = 160B
-    constexpr int64_t kTilingBufAligned =
-        ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;  // 96
-    constexpr int64_t kCombinedBytes = kCentroidBytes + kTilingBufAligned;  // 160
+    // ---- Build combined tiling+centroids buffer ----
+    // Layout: [tiling: 96B] [centroids: 64B] = 160B
+    constexpr int64_t kCombinedBytes = kTilingBufAligned + kCentroidBytes;  // 160
 
     // Create CPU buffer
     auto combinedCpu = torch::empty({kCombinedBytes}, at::kByte);
     auto* combinedPtr = combinedCpu.data_ptr<uint8_t>();
 
-    // Copy centroids as float32 (convert from whatever dtype the caller uses)
-    auto ctCpu = centroids.to(at::kCPU).to(at::kFloat).contiguous();
-    memcpy(combinedPtr, ctCpu.data_ptr<float>(), kCentroidBytes);
+    // TILING FIRST (offset 0, 96 bytes), then centroids (offset 96, 64 bytes)
+    // This avoids __gm__ pointer arithmetic in the kernel.
+    memcpy(combinedPtr, &tiling, sizeof(tiling));
 
-    // Copy tiling after centroids
-    memcpy(combinedPtr + kCentroidBytes, &tiling, sizeof(tiling));
+    // Copy centroids as float32 after tiling
+    auto ctCpu = centroids.to(at::kCPU).to(at::kFloat).contiguous();
+    memcpy(combinedPtr + kTilingBufAligned, ctCpu.data_ptr<float>(), kCentroidBytes);
 
     // Transfer to NPU via synchronous aclrtMemcpy
     auto combinedTensor = torch::empty({kCombinedBytes}, q.options().dtype(at::kByte));

@@ -117,14 +117,13 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 }
 
 // ---- Tiling data read via DataCopy + GetValue ----
-// Tiling is packed at byte offset kCentroidBytes (64) in the combined buffer.
+// Tiling is at offset 0 in the combined buffer. No pointer arithmetic needed.
+// Centroids are at offset kTilingBufAligned (96 bytes = 24 floats) in the same buffer.
 
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR centroidsTiling) {
-    constexpr uint32_t kCentroidBytes = 16 * sizeof(float);  // 64
-    // Point to tiling data: centroidsTiling + 64 bytes
-    __gm__ uint8_t* tilingBase = reinterpret_cast<__gm__ uint8_t*>(centroidsTiling) + kCentroidBytes;
+    // Tiling is at the START of the combined buffer — no offset needed
     GlobalTensor<int32_t> tilingGm;
-    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tilingBase));
+    tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(centroidsTiling));
 
     auto slotLocal = slotQueue.AllocTensor<int32_t>();
     constexpr uint32_t kTilingInt32Count = TILING_BUF_ALIGNED / sizeof(int32_t);  // 24
@@ -199,12 +198,15 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     qheadIdx_ = blockIdx % tiling.numQueryHeads;
     kvHead_ = qheadIdx_ / tiling.gqaRatio;
 
-    // Bind GM tensors (centroids at offset 0 of combined buffer)
+    // Bind GM tensors
+    // Centroids are at float offset 24 (96 bytes) in the combined buffer,
+    // after the tiling data (96 bytes = 24 int32).
     queryRotGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRot));
     kvCacheGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCache));
     blockTableGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(blockTable));
     seqLensGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLens));
-    centroidsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(centroidsTiling));
+    centroidsGm.SetGlobalBuffer(
+        reinterpret_cast<__gm__ float*>(centroidsTiling) + 24);  // skip 96 bytes of tiling
     outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output));
 
     // Store raw base addresses for offset-based DataCopy
