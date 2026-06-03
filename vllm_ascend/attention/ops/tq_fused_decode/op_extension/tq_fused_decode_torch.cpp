@@ -36,6 +36,20 @@ torch::Tensor tq_fused_decode_torch(
     auto sl = seq_lens.contiguous();
     auto ct = centroids.contiguous();
 
+    // Diagnostics: verify all tensors are on NPU with expected shapes
+    printf("[TQ-HOST] q: dev=%d shape=[%ld,%ld,%ld] dtype=%s ptr=%p\n",
+           static_cast<int>(q.device().type()),
+           q.size(0), q.size(1), q.size(2),
+           q.dtype().name().c_str(), q.data_ptr());
+    printf("[TQ-HOST] kv: dev=%d shape=[%ld,%ld,%ld,%ld] dtype=%s ptr=%p\n",
+           static_cast<int>(kv.device().type()),
+           kv.size(0), kv.size(1), kv.size(2), kv.size(3),
+           kv.dtype().name().c_str(), kv.data_ptr());
+    printf("[TQ-HOST] ct: dev=%d numel=%ld dtype=%s ptr=%p\n",
+           static_cast<int>(ct.device().type()),
+           ct.numel(), ct.dtype().name().c_str(), ct.data_ptr());
+    fflush(stdout);
+
     int64_t B = q.size(0);
     int64_t Hq = q.size(1);
     int64_t D = q.size(2);

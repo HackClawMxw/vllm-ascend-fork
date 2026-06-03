@@ -212,6 +212,13 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-PRE-QUERY b=%d h=%d seq=%d qOff=%d\n",
+                         batchIdx_, qheadIdx_, seqLen_,
+                         (int)(batchIdx_ * tiling.numQueryHeads * tiling.headDim
+                              + qheadIdx_ * tiling.headDim));
+    }
+
     // Load query vector (HEAD_DIM fp16 → fp32 in UB)
     auto queryFp32 = queryBuf.Get<float>();
     uint64_t qOffset = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
@@ -222,14 +229,26 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     auto queryHalfLocal = slotForQ.ReinterpretCast<half>();
     DataCopy(queryHalfLocal, queryOffsetGm, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
+
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-POST-QUERY\n");
+    }
+
     Cast(queryFp32, queryHalfLocal, RoundMode::CAST_NONE, HEAD_DIM);
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(slotForQ);
 
     // Load centroid table (16 fp32)
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-PRE-CENTROID\n");
+    }
     auto centroidLocal = centroidBuf.Get<float>();
     DataCopy(centroidLocal, centroidsGm, CENTROID_TABLE_SIZE);
     PipeBarrier<PIPE_ALL>();
+
+    if (blockIdx == 0) {
+        AscendC::printf("TQ-POST-CENTROID\n");
+    }
 
     // Initialize accumulator to zero
     auto accLocal = accBuf.Get<float>();
