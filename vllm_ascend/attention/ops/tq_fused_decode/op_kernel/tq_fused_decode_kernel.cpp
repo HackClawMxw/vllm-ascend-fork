@@ -122,6 +122,16 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
     GlobalTensor<int32_t> tilingGm;
     tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tilingData));
+
+    // DIAGNOSTIC: read first 2 values directly from GM (no DataCopy)
+    // to verify the GM address is correct and data is present.
+    if (GetBlockIdx() == 0) {
+        int32_t gm0 = tilingGm.GetValue(0);
+        int32_t gm1 = tilingGm.GetValue(1);
+        int32_t gm4 = tilingGm.GetValue(4);
+        AscendC::printf("TQ-GM-DIRECT: %d %d %d\n", gm0, gm1, gm4);
+    }
+
     auto slotLocal = slotQueue.AllocTensor<int32_t>();
     // Copy as int32 array (host transfers as int32 for reliable H2D copy).
     // TILING_BUF_ALIGNED bytes / 4 bytes per int32 = 24 elements.
@@ -132,7 +142,7 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR tilingData) {
     PipeBarrier<PIPE_ALL>();
 
     if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-RAW-TILING: %d %d %d %d %d %d\n",
+        AscendC::printf("TQ-UB-AFTER-DC: %d %d %d %d %d %d\n",
                          slotLocal.GetValue(0), slotLocal.GetValue(1),
                          slotLocal.GetValue(2), slotLocal.GetValue(3),
                          slotLocal.GetValue(4), slotLocal.GetValue(5));

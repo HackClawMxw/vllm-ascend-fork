@@ -31,14 +31,26 @@ torch::Tensor tq_fused_decode_torch(
     int64_t block_size,
     bool norm_correction) {
     // Kernel reads query as half (fp16). Caller may pass float32.
-    auto q = query_rot.contiguous().to(at::kHalf);
+    auto q = query_rot.contiguous();
+    printf("[TQ-HOST] q before conv: dtype=%d\n", static_cast<int>(q.scalar_type()));
+    fflush(stdout);
+    if (q.scalar_type() != at::kHalf) {
+        q = q.toType(at::kHalf);
+    }
+    printf("[TQ-HOST] q after conv: dtype=%d\n", static_cast<int>(q.scalar_type()));
+    fflush(stdout);
     auto kv = kv_cache.contiguous();
     // Ensure correct device + dtype: kernel reads block_table/seq_lens as int32,
     // centroids as float32. Guard against host-side int64 or CPU tensors that
     // would cause MTE "DDR address out of range" (error 507057).
     auto bt = block_table.contiguous().to(q.device(), at::kInt);
     auto sl = seq_lens.contiguous().to(q.device(), at::kInt);
-    auto ct = centroids.contiguous().to(q.device(), at::kFloat);
+    torch::Tensor ct;
+    if (centroids.scalar_type() != at::kFloat) {
+        ct = centroids.contiguous().toType(at::kFloat).to(q.device());
+    } else {
+        ct = centroids.contiguous().to(q.device());
+    }
 
     // Diagnostics: verify all tensors are on NPU with expected shapes/dtypes
     printf("[TQ-HOST] q: dev=%d dtype=%d shape=[%ld,%ld,%ld] ptr=%p\n",
@@ -103,22 +115,43 @@ torch::Tensor tq_fused_decode_torch(
     uint32_t blockDim = tiling.gridSize;
     if (blockDim == 0) blockDim = 1;
 
-    // Copy tiling to device as int32 tensor.
-    // Previous approach (at::from_blob + at::kByte + .to(device)) produced garbage
-    // on NPU — torch_npu may not reliably transfer uint8 blobs H2D.
-    // Using int32 ensures a well-supported dtype for the H2D copy.
+    // Copy tiling to device via aclrtMemcpy (synchronous H2D).
+    // torch .to(device) may be async on torch_npu, causing the kernel
+    // to read uninitialized NPU memory (poison pattern 0xD160D160).
     constexpr int64_t kTilingBufAligned =
         ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;  // = 96
     constexpr int64_t kTilingInt32Len = kTilingBufAligned / sizeof(int32_t); // = 24
     auto cpuTiling = torch::empty({kTilingInt32Len}, at::kInt);
     memcpy(cpuTiling.data_ptr<int32_t>(), &tiling, sizeof(tiling));
-    auto tilingTensor = cpuTiling.to(q.device());
 
-    // Verify tiling bytes before launch
+    // Allocate NPU tensor and copy synchronously
+    auto tilingTensor = torch::empty({kTilingInt32Len}, q.options().dtype(at::kInt));
+    aclError memcpyRet = aclrtMemcpy(
+        tilingTensor.data_ptr(), kTilingBufAligned,
+        cpuTiling.data_ptr(), kTilingBufAligned,
+        ACL_MEMCPY_HOST_TO_DEVICE);
     printf("[TQ-HOST] tiling hex:");
     auto* tp = cpuTiling.data_ptr<int32_t>();
     for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(tp[i]));
-    printf(" ... ptr=%p\n", tilingTensor.data_ptr());
+    printf(" ... npu_ptr=%p memcpy_ret=%d\n", tilingTensor.data_ptr(), (int)memcpyRet);
+    fflush(stdout);
+
+    // Readback verification: copy NPU→CPU and compare
+    auto verifyTiling = torch::empty({kTilingInt32Len}, at::kInt);
+    aclError rbRet = aclrtMemcpy(
+        verifyTiling.data_ptr(), kTilingBufAligned,
+        tilingTensor.data_ptr(), kTilingBufAligned,
+        ACL_MEMCPY_DEVICE_TO_HOST);
+    auto* vp = verifyTiling.data_ptr<int32_t>();
+    bool match = true;
+    for (int i = 0; i < 18; i++) {
+        if (static_cast<uint32_t>(vp[i]) != static_cast<uint32_t>(tp[i])) {
+            match = false;
+            printf("[TQ-HOST] MISMATCH idx=%d host=%08x npu=%08x\n",
+                   i, static_cast<uint32_t>(tp[i]), static_cast<uint32_t>(vp[i]));
+        }
+    }
+    if (match) printf("[TQ-HOST] tiling readback OK (all 18 int32 match)\n");
     fflush(stdout);
 
     // Launch kernel via direct C function call (not <<<>>> syntax)
