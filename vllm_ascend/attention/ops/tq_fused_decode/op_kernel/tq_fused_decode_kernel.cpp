@@ -216,6 +216,15 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(queryFp16);
 
+    // DIAG: verify query for head 19 (the one that keeps getting NaN)
+    if (blockIdx == 19) {
+        auto q = queryBuf.Get<float>();
+        AscendC::printf("TQ-DIAG-H19 query[%d][%d] cast=%f %f %f %f seq=%d\n",
+                         batchIdx_, qheadIdx_,
+                         q.GetValue(0), q.GetValue(1), q.GetValue(2), q.GetValue(3),
+                         seqLen_);
+    }
+
     // Load centroid table (16 fp32)
     auto centroidLocal = centroidBuf.Get<float>();
     DataCopy(centroidLocal, centroidsGm, CENTROID_TABLE_SIZE);
@@ -366,11 +375,35 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
         PipeBarrier<PIPE_ALL>();
 
+        // DIAG: print score for head 19 at tokens 0, 1, 62
+        if (blockIdx == 19 && (tokenPos == 0 || tokenPos == 1 || tokenPos == seqLen_ - 1)) {
+            float rawSc = 0.0f;
+            auto cl = centroidBuf.Get<float>();
+            auto ql = queryBuf.Get<float>();
+            for (uint32_t bi = 0; bi < MSE_BYTES; bi++) {
+                uint8_t pk = slotLocal.GetValue(bi);
+                float cL = cl.GetValue(pk & 0xF);
+                float cH = cl.GetValue((pk >> 4) & 0xF);
+                rawSc += ql.GetValue(bi*2+0)*cL + ql.GetValue(bi*2+1)*cH;
+            }
+            float vn = ReadFp16AsFp32(slotLocal, MSE_BYTES);
+            AscendC::printf("TQ-DIAG-H19 tok=%d pblk=%d addr=%lu rawSc=%f vn=%f\n",
+                             tokenPos, physicalBlock, slotAddr, rawSc, vn);
+        }
+
         ComputeScoreAndAccumulate(slotLocal);
     }
 
     // Final normalization: output = acc / runningSum
     auto accLocal = accBuf.Get<float>();
+
+    // DIAG: head 19 final state
+    if (blockIdx == 19) {
+        AscendC::printf("TQ-DIAG-H19 FINAL max=%f sum=%f acc0=%f acc1=%f\n",
+                         runningMax_, runningSum_,
+                         accLocal.GetValue(0), accLocal.GetValue(1));
+    }
+
     float invSum = 1.0f / runningSum_;
     Muls(accLocal, accLocal, invSum, tiling.headDim);
     pipe_barrier(PIPE_V);
