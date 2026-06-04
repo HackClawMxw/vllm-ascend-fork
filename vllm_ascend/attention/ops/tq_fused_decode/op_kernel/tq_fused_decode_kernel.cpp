@@ -72,6 +72,7 @@ private:
     uint32_t qheadIdx_;
     uint32_t kvHead_;
     uint32_t seqLen_;
+    uint32_t curTokenPos_;
 
     // Online softmax state (scalar, kept in registers)
     float runningMax_;
@@ -216,13 +217,14 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(queryFp16);
 
-    // DIAG: verify query for head 19 (the one that keeps getting NaN)
+    // DIAG: verify query + tiling for head 19
     if (blockIdx == 19) {
         auto q = queryBuf.Get<float>();
-        AscendC::printf("TQ-DIAG-H19 query[%d][%d] cast=%f %f %f %f seq=%d\n",
+        AscendC::printf("TQ-DIAG-H19 init q[%d][%d] cast[0:3]=%f %f %f %f q60=%f q120=%f seq=%d smSc=%f nCorr=%d\n",
                          batchIdx_, qheadIdx_,
                          q.GetValue(0), q.GetValue(1), q.GetValue(2), q.GetValue(3),
-                         seqLen_);
+                         q.GetValue(60), q.GetValue(120),
+                         seqLen_, tiling.smScale, tiling.normCorrection);
     }
 
     // Load centroid table (16 fp32)
@@ -278,6 +280,13 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
 
     float vecNorm = ReadFp16AsFp32(slotUb, MSE_BYTES);
     float score = rawScore * vecNorm * tiling.smScale;
+
+    // DIAG: print score details for head 19
+    if (GetBlockIdx() == 19 && (curTokenPos_ == 0 || curTokenPos_ == seqLen_ - 1 ||
+                                 score > 100.0f || score < -100.0f)) {
+        AscendC::printf("TQ-DIAG-H19 SCORE tok=%d rawSc=%f nSq=%f vn=%f smSc=%f score=%f\n",
+                         curTokenPos_, rawScore, normSq, vecNorm, tiling.smScale, score);
+    }
 
     // Online softmax update
     float newMax = (score > runningMax_) ? score : runningMax_;
@@ -375,25 +384,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
         PipeBarrier<PIPE_ALL>();
 
-        // DIAG: print score for head 19 at tokens 0 and last
-        if (GetBlockIdx() == 19 && (tokenPos == 0 || tokenPos == seqLen_ - 1)) {
-            auto cl = centroidBuf.Get<float>();
-            auto ql = queryBuf.Get<float>();
-            // Print first 4 packed bytes, centroid lookups, and query values
-            uint8_t p0 = slotLocal.GetValue(0);
-            uint8_t p1 = slotLocal.GetValue(1);
-            AscendC::printf("TQ-DIAG-H19 tok=%d pblk=%d slot[0:3]=%d %d %d %d c0=%f c1=%f q0=%f q1=%f\n",
-                             tokenPos, physicalBlock,
-                             (int)p0, (int)p1,
-                             (int)slotLocal.GetValue(2), (int)slotLocal.GetValue(3),
-                             cl.GetValue(p0 & 0xF), cl.GetValue((p0 >> 4) & 0xF),
-                             ql.GetValue(0), ql.GetValue(1));
-            // Print centroid[0:4] to verify table
-            AscendC::printf("TQ-DIAG-H19 centroid[0:4]=%f %f %f %f\n",
-                             cl.GetValue(0), cl.GetValue(1),
-                             cl.GetValue(2), cl.GetValue(3));
-        }
-
+        curTokenPos_ = tokenPos;
         ComputeScoreAndAccumulate(slotLocal);
     }
 
