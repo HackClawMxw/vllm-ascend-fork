@@ -78,34 +78,33 @@ torch::Tensor tq_fused_decode_torch(
     auto* combinedPtr = combinedCpu.data_ptr<uint8_t>();
 
     // TILING FIRST (offset 0, 96 bytes), then centroids (offset 96, 64 bytes)
-    // This avoids __gm__ pointer arithmetic in the kernel.
     memcpy(combinedPtr, &tiling, sizeof(tiling));
 
     // Copy centroids as float32 after tiling
     auto ctCpu = centroids.to(at::kCPU).to(at::kFloat).contiguous();
     memcpy(combinedPtr + kTilingBufAligned, ctCpu.data_ptr<float>(), kCentroidBytes);
 
-    // Transfer to NPU via synchronous aclrtMemcpy
-    auto combinedTensor = torch::empty({kCombinedBytes}, q.options().dtype(at::kByte));
+    // Allocate device memory directly via aclrtMalloc (bypasses PyTorch allocator)
+    void* combinedDevPtr = nullptr;
+    aclError allocRet = aclrtMalloc(&combinedDevPtr, kCombinedBytes, ACL_MEM_MALLOC_NORMAL);
     aclError memcpyRet = aclrtMemcpy(
-        combinedTensor.data_ptr(), kCombinedBytes,
+        combinedDevPtr, kCombinedBytes,
         combinedCpu.data_ptr(), kCombinedBytes,
         ACL_MEMCPY_HOST_TO_DEVICE);
 
-    // Diagnostics
-    printf("[TQ-HOST] q: dev=%d dtype=%d shape=[%ld,%ld,%ld]\n",
-           static_cast<int>(q.device().type()),
-           static_cast<int>(q.scalar_type()),
-           q.size(0), q.size(1), q.size(2));
-    printf("[TQ-HOST] kv: dev=%d dtype=%d shape=[%ld,%ld,%ld,%ld]\n",
-           static_cast<int>(kv.device().type()),
-           static_cast<int>(kv.scalar_type()),
-           kv.size(0), kv.size(1), kv.size(2), kv.size(3));
-    printf("[TQ-HOST] ct: dtype=%d numel=%ld -> combined as fp32\n",
-           static_cast<int>(centroids.scalar_type()),
-           centroids.numel());
-    printf("[TQ-HOST] combined ptr=%p memcpy_ret=%d\n",
-           combinedTensor.data_ptr(), (int)memcpyRet);
+    // Readback verification
+    uint8_t readback[96];
+    aclError rbRet = aclrtMemcpy(readback, 96, combinedDevPtr, 96, ACL_MEMCPY_DEVICE_TO_HOST);
+    auto* rbp = reinterpret_cast<int32_t*>(readback);
+    auto* htp = reinterpret_cast<int32_t*>(combinedPtr);
+    printf("[TQ-HOST] combined dev=%p alloc=%d memcpy=%d rb=%d\n",
+           combinedDevPtr, (int)allocRet, (int)memcpyRet, (int)rbRet);
+    printf("[TQ-HOST] host:");
+    for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(htp[i]));
+    printf("\n[TQ-HOST] npu :");
+    for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(rbp[i]));
+    bool match = (memcmp(readback, combinedPtr, 72) == 0);
+    printf("\n[TQ-HOST] match=%s\n", match ? "YES" : "NO");
     printf("[TQ-HOST] Launching blockDim=%d grid=%d B=%d Hq=%d Hk=%d "
            "headDim=%d blockSize=%d slotSize=%d blockStride=%lu slotStride=%lu\n",
            blockDim, tiling.gridSize, tiling.batchSize, tiling.numQueryHeads,
@@ -118,16 +117,22 @@ torch::Tensor tq_fused_decode_torch(
     auto output = at::full({B, Hq, D}, -42.0f, q.options().dtype(at::kHalf));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(true);
 
-    // 6-argument kernel launch
+    // 6-argument kernel launch using raw device pointer
     aclrtlaunch_tq_fused_decode_kernel(
         blockDim, nullptr, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
-        sl.data_ptr(), combinedTensor.data_ptr(), output.data_ptr());
+        sl.data_ptr(), combinedDevPtr, output.data_ptr());
 
     aclError aclRet = aclrtSynchronizeStream(aclStream);
     printf("[TQ-HOST] sync=%d output[0][0][0]=%f\n",
            (int)aclRet,
            static_cast<float>(output[0][0][0].item<at::Half>()));
+    fflush(stdout);
+
+    // Free the raw device memory
+    aclrtFree(combinedDevPtr);
+
+    return output;
     fflush(stdout);
 
     return output;
