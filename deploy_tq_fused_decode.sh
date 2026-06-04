@@ -82,10 +82,12 @@ sudo docker cp ${VLLM_ASCEND_HOST_DIR}/patch/platform/patch_tq_attention.py   ${
 if [ "$SKIP_KERNEL" = false ]; then
     echo "=== Copying tq_fused_decode source ==="
     # Clean old files first — docker cp merges, doesn't replace
+    # Also remove lib/ to force kernel .so rebuild (CANN caches it there)
     sudo docker exec ${CONTAINER} rm -rf ${SITE}/attention/ops/tq_fused_decode/op_kernel \
                                           ${SITE}/attention/ops/tq_fused_decode/op_host \
                                           ${SITE}/attention/ops/tq_fused_decode/op_extension \
-                                          ${SITE}/attention/ops/tq_fused_decode/build
+                                          ${SITE}/attention/ops/tq_fused_decode/build \
+                                          ${SITE}/attention/ops/tq_fused_decode/lib
     sudo docker exec ${CONTAINER} mkdir -p ${SITE}/attention/ops/tq_fused_decode
     sudo docker cp ${VLLM_ASCEND_HOST_DIR}/attention/ops/tq_fused_decode/CMakeLists.txt \
         ${CONTAINER}:${SITE}/attention/ops/tq_fused_decode/
