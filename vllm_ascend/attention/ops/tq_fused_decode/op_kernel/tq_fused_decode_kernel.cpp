@@ -375,20 +375,23 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         DataCopy(slotLocal, kvSlotGm, SLOT_BUF_ALIGNED);
         PipeBarrier<PIPE_ALL>();
 
-        // DIAG: print score for head 19 at tokens 0, 1, 62
-        if (GetBlockIdx() == 19 && (tokenPos == 0 || tokenPos == 1 || tokenPos == seqLen_ - 1)) {
-            float rawSc = 0.0f;
+        // DIAG: print score for head 19 at tokens 0 and last
+        if (GetBlockIdx() == 19 && (tokenPos == 0 || tokenPos == seqLen_ - 1)) {
             auto cl = centroidBuf.Get<float>();
             auto ql = queryBuf.Get<float>();
-            for (uint32_t bi = 0; bi < MSE_BYTES; bi++) {
-                uint8_t pk = slotLocal.GetValue(bi);
-                float cL = cl.GetValue(pk & 0xF);
-                float cH = cl.GetValue((pk >> 4) & 0xF);
-                rawSc += ql.GetValue(bi*2+0)*cL + ql.GetValue(bi*2+1)*cH;
-            }
-            float vn = ReadFp16AsFp32(slotLocal, MSE_BYTES);
-            AscendC::printf("TQ-DIAG-H19 tok=%d pblk=%d addr=%lu rawSc=%f vn=%f\n",
-                             tokenPos, physicalBlock, slotAddr, rawSc, vn);
+            // Print first 4 packed bytes, centroid lookups, and query values
+            uint8_t p0 = slotLocal.GetValue(0);
+            uint8_t p1 = slotLocal.GetValue(1);
+            AscendC::printf("TQ-DIAG-H19 tok=%d pblk=%d slot[0:3]=%d %d %d %d c0=%f c1=%f q0=%f q1=%f\n",
+                             tokenPos, physicalBlock,
+                             (int)p0, (int)p1,
+                             (int)slotLocal.GetValue(2), (int)slotLocal.GetValue(3),
+                             cl.GetValue(p0 & 0xF), cl.GetValue((p0 >> 4) & 0xF),
+                             ql.GetValue(0), ql.GetValue(1));
+            // Print centroid[0:4] to verify table
+            AscendC::printf("TQ-DIAG-H19 centroid[0:4]=%f %f %f %f\n",
+                             cl.GetValue(0), cl.GetValue(1),
+                             cl.GetValue(2), cl.GetValue(3));
         }
 
         ComputeScoreAndAccumulate(slotLocal);
