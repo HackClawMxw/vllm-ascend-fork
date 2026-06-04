@@ -376,7 +376,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
         PipeBarrier<PIPE_ALL>();
 
         // DIAG: print score for head 19 at tokens 0, 1, 62
-        if (blockIdx == 19 && (tokenPos == 0 || tokenPos == 1 || tokenPos == seqLen_ - 1)) {
+        if (GetBlockIdx() == 19 && (tokenPos == 0 || tokenPos == 1 || tokenPos == seqLen_ - 1)) {
             float rawSc = 0.0f;
             auto cl = centroidBuf.Get<float>();
             auto ql = queryBuf.Get<float>();
@@ -398,7 +398,7 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
     auto accLocal = accBuf.Get<float>();
 
     // DIAG: head 19 final state
-    if (blockIdx == 19) {
+    if (GetBlockIdx() == 19) {
         AscendC::printf("TQ-DIAG-H19 FINAL max=%f sum=%f acc0=%f acc1=%f\n",
                          runningMax_, runningSum_,
                          accLocal.GetValue(0), accLocal.GetValue(1));
