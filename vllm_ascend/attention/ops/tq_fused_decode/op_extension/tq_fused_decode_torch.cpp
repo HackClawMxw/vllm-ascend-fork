@@ -86,7 +86,7 @@ torch::Tensor tq_fused_decode_torch(
 
     // Allocate device memory directly via aclrtMalloc (bypasses PyTorch allocator)
     void* combinedDevPtr = nullptr;
-    aclError allocRet = aclrtMalloc(&combinedDevPtr, kCombinedBytes, ACL_MEM_MALLOC_NORMAL);
+    aclError allocRet = aclrtMalloc(&combinedDevPtr, kCombinedBytes, ACL_MEM_MALLOC_NORMAL_ONLY);
     aclError memcpyRet = aclrtMemcpy(
         combinedDevPtr, kCombinedBytes,
         combinedCpu.data_ptr(), kCombinedBytes,
