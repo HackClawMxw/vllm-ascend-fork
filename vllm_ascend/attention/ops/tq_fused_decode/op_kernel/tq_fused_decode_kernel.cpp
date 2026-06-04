@@ -252,6 +252,9 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
     float rawScore = 0.0f;
     float normSq = 0.0f;
 
+    // DIAG: verify rawScore starts at 0 and print first term for head 19 token 0
+    bool diagHead19 = (GetBlockIdx() == 19 && curTokenPos_ == 0);
+
     if (tiling.normCorrection) {
         for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
             uint8_t packed = slotUb.GetValue(byteIdx);
@@ -261,7 +264,15 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
             float cHi = centroidLocal.GetValue(hiIdx);
             float qLo = queryLocal.GetValue(byteIdx * 2 + 0);
             float qHi = queryLocal.GetValue(byteIdx * 2 + 1);
-            rawScore += qLo * cLo + qHi * cHi;
+            float term = qLo * cLo + qHi * cHi;
+
+            if (diagHead19 && byteIdx < 4) {
+                AscendC::printf("TQ-DIAG-H19 T%02d pk=%d lo=%d hi=%d cL=%f cH=%f qL=%f qH=%f term=%f rawSc=%f\n",
+                                 byteIdx, (int)packed, (int)loIdx, (int)hiIdx,
+                                 cLo, cHi, qLo, qHi, term, rawScore);
+            }
+
+            rawScore += term;
             normSq += cLo * cLo + cHi * cHi;
         }
         rawScore *= 1.0f / ScalarSqrt(normSq + 1e-16f);
