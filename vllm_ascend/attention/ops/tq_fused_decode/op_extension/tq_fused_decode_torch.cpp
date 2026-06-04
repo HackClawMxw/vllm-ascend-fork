@@ -85,47 +85,32 @@ torch::Tensor tq_fused_decode_torch(
     // Allocate device memory directly via aclrtMalloc (bypasses PyTorch allocator)
     void* combinedDevPtr = nullptr;
     aclError allocRet = aclrtMalloc(&combinedDevPtr, kCombinedBytes, ACL_MEM_MALLOC_NORMAL_ONLY);
+    if (allocRet != ACL_SUCCESS) {
+        printf("[TQ] ERROR aclrtMalloc failed: %d\n", (int)allocRet);
+        return at::zeros({q.size(0), q.size(1), q.size(2)}, q.options().dtype(at::kHalf));
+    }
     aclError memcpyRet = aclrtMemcpy(
         combinedDevPtr, kCombinedBytes,
         combinedCpu.data_ptr(), kCombinedBytes,
         ACL_MEMCPY_HOST_TO_DEVICE);
 
-    // Readback verification
-    uint8_t readback[96];
-    aclError rbRet = aclrtMemcpy(readback, 96, combinedDevPtr, 96, ACL_MEMCPY_DEVICE_TO_HOST);
-    auto* rbp = reinterpret_cast<int32_t*>(readback);
-    auto* htp = reinterpret_cast<int32_t*>(combinedPtr);
-    printf("[TQ-HOST] combined dev=%p alloc=%d memcpy=%d rb=%d\n",
-           combinedDevPtr, (int)allocRet, (int)memcpyRet, (int)rbRet);
-    printf("[TQ-HOST] host:");
-    for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(htp[i]));
-    printf("\n[TQ-HOST] npu :");
-    for (int i = 0; i < 6; i++) printf(" %08x", static_cast<uint32_t>(rbp[i]));
-    bool match = (memcmp(readback, combinedPtr, 72) == 0);
-    printf("\n[TQ-HOST] match=%s\n", match ? "YES" : "NO");
-    printf("[TQ-HOST] Launching blockDim=%d grid=%d B=%d Hq=%d Hk=%d "
-           "headDim=%d blockSize=%d slotSize=%d blockStride=%lu slotStride=%lu\n",
-           blockDim, tiling.gridSize, tiling.batchSize, tiling.numQueryHeads,
-           tiling.numKvHeads, tiling.headDim, tiling.blockSize, tiling.slotSize,
-           (unsigned long)tiling.blockStride, (unsigned long)tiling.slotStride);
-    fflush(stdout);
-
-    // Output tensor (fp16, sentinel -42.0 for diagnostic)
     int64_t B = q.size(0), Hq = q.size(1), D = q.size(2);
-    auto output = at::full({B, Hq, D}, -42.0f, q.options().dtype(at::kHalf));
+    auto output = at::empty({B, Hq, D}, q.options().dtype(at::kHalf));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
 
-    // 6-argument kernel launch — no l2Ctrl, matches generated stub exactly
     aclrtlaunch_tq_fused_decode_kernel(
         blockDim, aclStream,
         q.data_ptr(), kv.data_ptr(), bt.data_ptr(),
         sl.data_ptr(), combinedDevPtr, output.data_ptr());
 
     aclError aclRet = aclrtSynchronizeStream(aclStream);
-    printf("[TQ-HOST] sync=%d output[0][0][0]=%f\n",
-           (int)aclRet,
-           static_cast<float>(output[0][0][0].item<at::Half>()));
-    fflush(stdout);
+    if (aclRet != ACL_SUCCESS) {
+        printf("[TQ] ERROR sync=%d B=%lld Hq=%lld seq0=%d slotSize=%d blockStride=%lu\n",
+               (int)aclRet, (long long)B, (long long)Hq,
+               (int)sl.item<int32_t>(), tiling.slotSize,
+               (unsigned long)tiling.blockStride);
+        fflush(stdout);
+    }
 
     // Free the raw device memory
     aclrtFree(combinedDevPtr);

@@ -130,13 +130,7 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR centroidsTiling) 
     DataCopy(slotLocal, tilingGm, kTilingInt32Count);
     PipeBarrier<PIPE_ALL>();
 
-    if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-TILING: B=%d Hq=%d Hk=%d grid=%d bs=%d hd=%d\n",
-                         slotLocal.GetValue(0), slotLocal.GetValue(1),
-                         slotLocal.GetValue(2), slotLocal.GetValue(4),
-                         slotLocal.GetValue(5), slotLocal.GetValue(6));
-    }
-
+    // (removed per-core tiling dump — too verbose in production)
     tiling.batchSize       = slotLocal.GetValue(0);
     tiling.numQueryHeads   = slotLocal.GetValue(1);
     tiling.numKvHeads      = slotLocal.GetValue(2);
@@ -172,10 +166,6 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     uint32_t blockIdx = GetBlockIdx();
 
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-INIT-ENTRY block=%d\n", blockIdx);
-    }
-
     // Init UB buffers
     pipe.InitBuffer(slotQueue, 1, SLOT_QUEUE_BUF);
     pipe.InitBuffer(queryBuf, QUERY_BUF_SIZE);
@@ -184,12 +174,7 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     pipe.InitBuffer(valBuf, VAL_BUF_SIZE);
     pipe.InitBuffer(weightedBuf, WEIGHTED_BUF_SIZE);
 
-    // Read tiling from combined buffer (at offset kCentroidBytes=64)
     ReadTiling(centroidsTiling);
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-POST-TILING grid=%d B=%d Hq=%d\n",
-                         tiling.gridSize, tiling.batchSize, tiling.numQueryHeads);
-    }
 
     // Early exit if this core has no work
     if (blockIdx >= tiling.gridSize) return;
@@ -216,11 +201,6 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-PRE-QUERY b=%d h=%d seq=%d\n",
-                         batchIdx_, qheadIdx_, seqLen_);
-    }
-
     // Load query vector as float32 directly (torch_npu may pass fp32 query
     // even when we request fp16 — the .to(kHalf) call is ignored).
     auto queryFp32 = queryBuf.Get<float>();
@@ -231,21 +211,10 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     DataCopy(queryFp32, queryOffsetGm, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
 
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-POST-QUERY\n");
-    }
-
     // Load centroid table (16 fp32)
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-PRE-CENTROID\n");
-    }
     auto centroidLocal = centroidBuf.Get<float>();
     DataCopy(centroidLocal, centroidsGm, CENTROID_TABLE_SIZE);
     PipeBarrier<PIPE_ALL>();
-
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-POST-CENTROID\n");
-    }
 
     // Initialize accumulator to zero
     auto accLocal = accBuf.Get<float>();
@@ -255,12 +224,6 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     // Initialize online softmax state
     runningMax_ = -3.4e38f;
     runningSum_ = 0.0f;
-
-    if (blockIdx == 0) {
-        AscendC::printf("TQ-INIT-DONE b=%d h=%d grid=%d seq=%d headDim=%d\n",
-                         batchIdx_, qheadIdx_, tiling.gridSize,
-                         seqLen_, tiling.headDim);
-    }
 }
 
 // ---- Score + online softmax + value dequant + accumulate ----
@@ -359,12 +322,6 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
 
 __aicore__ inline void KernelTqFusedDecode::Process() {
     if (GetBlockIdx() >= tiling.gridSize) return;
-
-    if (GetBlockIdx() == 0) {
-        AscendC::printf("TQ-PROCESS block=%d grid=%d seq=%d headDim=%d\n",
-                         GetBlockIdx(), tiling.gridSize,
-                         seqLen_, tiling.headDim);
-    }
 
     // Handle empty sequence
     if (seqLen_ == 0) {
