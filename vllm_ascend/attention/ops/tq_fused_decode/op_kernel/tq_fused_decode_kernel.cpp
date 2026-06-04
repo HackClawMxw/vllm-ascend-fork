@@ -201,15 +201,20 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
-    // Load query vector as float32 directly (torch_npu may pass fp32 query
-    // even when we request fp16 — the .to(kHalf) call is ignored).
-    auto queryFp32 = queryBuf.Get<float>();
+    // Load query as fp16, then Cast to fp32 for computation.
+    // The host always sends fp16 query (via .to(torch.float16)).
     uint64_t qOffset = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                      + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
-    GlobalTensor<float> queryOffsetGm;
-    queryOffsetGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(queryRotBase_) + qOffset);
-    DataCopy(queryFp32, queryOffsetGm, HEAD_DIM);
+    GlobalTensor<half> queryFp16Gm;
+    queryFp16Gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRotBase_) + qOffset);
+    auto queryFp16 = slotQueue.AllocTensor<half>();
+    DataCopy(queryFp16, queryFp16Gm, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
+
+    auto queryFp32 = queryBuf.Get<float>();
+    Cast(queryFp32, queryFp16, RoundMode::CAST_ROUND, HEAD_DIM);
+    pipe_barrier(PIPE_V);
+    slotQueue.FreeTensor(queryFp16);
 
     // Load centroid table (16 fp32)
     auto centroidLocal = centroidBuf.Get<float>();
