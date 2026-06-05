@@ -3,6 +3,9 @@
 
 using namespace AscendC;
 
+// Set to 1 to enable diagnostic prints for head 19, 0 for production.
+#define TQ_KERNEL_DEBUG 1
+
 // Cache geometry constants
 constexpr uint32_t SLOT_SIZE = 134;
 constexpr uint32_t HEAD_DIM = 128;
@@ -12,18 +15,16 @@ constexpr uint32_t VAL_DATA_BYTES = 64;
 constexpr uint32_t CENTROID_TABLE_SIZE = 16;
 
 // UB buffer sizes (all 32-byte aligned)
-constexpr uint32_t QUERY_BUF_SIZE = HEAD_DIM * sizeof(float);        // 512
+constexpr uint32_t QUERY_BUF_SIZE = HEAD_DIM * sizeof(float);           // 512
 constexpr uint32_t CENTROID_BUF_SIZE = CENTROID_TABLE_SIZE * sizeof(float); // 64
-constexpr uint32_t ACC_BUF_SIZE = HEAD_DIM * sizeof(float);          // 512
-constexpr uint32_t VAL_BUF_SIZE = HEAD_DIM * sizeof(float);          // 512
-constexpr uint32_t WEIGHTED_BUF_SIZE = HEAD_DIM * sizeof(float);     // 512
-// Slot data padded to 32-byte alignment for DataCopy
-constexpr uint32_t SLOT_BUF_ALIGNED = ((SLOT_SIZE + 31) / 32) * 32; // 160
-// Tiling struct padded to 32-byte alignment
+constexpr uint32_t ACC_BUF_SIZE = HEAD_DIM * sizeof(float);             // 512
+constexpr uint32_t VAL_BUF_SIZE = HEAD_DIM * sizeof(float);             // 512
+constexpr uint32_t PRODUCT_BUF_SIZE = HEAD_DIM * sizeof(float);         // 512
+// ReduceSum workLocal: min 8 floats for 128-element input; allocate 64 for margin
+constexpr uint32_t WORK_BUF_SIZE = 64 * sizeof(float);                  // 256
+constexpr uint32_t SLOT_BUF_ALIGNED = ((SLOT_SIZE + 31) / 32) * 32;    // 160
 constexpr uint32_t TILING_BUF_ALIGNED = ((sizeof(TqFusedDecodeTilingData) + 31) / 32) * 32;
-// Slot queue buffer must hold the largest of: tiling (96B), slot data (160B),
-// or query/output half values (HEAD_DIM * 2 = 256B).
-constexpr uint32_t SLOT_QUEUE_BUF = HEAD_DIM * sizeof(half); // 256, already 32-byte aligned
+constexpr uint32_t SLOT_QUEUE_BUF = HEAD_DIM * sizeof(half);            // 256
 
 class KernelTqFusedDecode {
 public:
@@ -33,8 +34,6 @@ public:
     __aicore__ inline void Process();
 
 private:
-    __aicore__ inline float ScalarExp(float x);
-    __aicore__ inline float ScalarSqrt(float x);
     __aicore__ inline float ReadFp16AsFp32(LocalTensor<uint8_t>& slotUb, uint32_t offset);
     __aicore__ inline void ComputeScoreAndAccumulate(LocalTensor<uint8_t>& slotUb);
     __aicore__ inline void DequantValueAndAccumulate(LocalTensor<uint8_t>& slotUb,
@@ -51,18 +50,19 @@ private:
     GlobalTensor<float> centroidsGm;
     GlobalTensor<half> outputGm;
 
-    // Raw GM base addresses for offset-based DataCopy
     GM_ADDR queryRotBase_;
     GM_ADDR kvCacheBase_;
     GM_ADDR outputBase_;
 
-    // UB buffers
-    TBuf<QuePosition::VECCALC> queryBuf;
-    TBuf<QuePosition::VECCALC> centroidBuf;
-    TBuf<QuePosition::VECCALC> accBuf;
-    TBuf<QuePosition::VECCALC> valBuf;
-    TBuf<QuePosition::VECCALC> weightedBuf;
-    TQue<QuePosition::VECIN, 1> slotQueue;
+    // UB buffers — valBuf / productBuf are time-shared between score and
+    // value-accumulate phases (no overlap in lifetime).
+    TBuf<QuePosition::VECCALC> queryBuf;      // 512B — query fp32 [128]
+    TBuf<QuePosition::VECCALC> centroidBuf;   //  64B — centroid table [16]
+    TBuf<QuePosition::VECCALC> accBuf;        // 512B — output accumulator [128]
+    TBuf<QuePosition::VECCALC> valBuf;        // 512B — gathered centroids (score) / dequant values (accum)
+    TBuf<QuePosition::VECCALC> productBuf;    // 512B — query*centroid (score) / weight*val (accum)
+    TBuf<QuePosition::VECCALC> workBuf;       // 256B — ReduceSum workspace + Exp/Sqrt temp
+    TQue<QuePosition::VECIN, 1> slotQueue;    // 256B — slot data / fp16 staging
 
     // Tiling data
     TqFusedDecodeTilingData tiling;
@@ -72,39 +72,12 @@ private:
     uint32_t qheadIdx_;
     uint32_t kvHead_;
     uint32_t seqLen_;
-    uint32_t curTokenPos_;
+    uint32_t curTokenPos_;  // for diagnostics only
 
     // Online softmax state (scalar, kept in registers)
     float runningMax_;
     float runningSum_;
 };
-
-// ---- Scalar math helpers using AscendC Vector API ----
-
-__aicore__ inline float KernelTqFusedDecode::ScalarExp(float x) {
-    LocalTensor<float> tmp;
-    tmp = valBuf.Get<float>();
-    tmp.SetValue(0, x);
-    // SetValue is on the Scalar pipe; Exp is on Vector pipe.
-    // pipe_barrier(PIPE_V) does NOT synchronize the Scalar pipe.
-    // Without PIPE_ALL, the Vector unit may read stale UB.
-    PipeBarrier<PIPE_ALL>();
-    Exp(tmp, tmp, 1);
-    // Same reasoning: GetValue on Scalar pipe must wait for Vector write.
-    PipeBarrier<PIPE_ALL>();
-    float result = tmp.GetValue(0);
-    return result;
-}
-
-__aicore__ inline float KernelTqFusedDecode::ScalarSqrt(float x) {
-    LocalTensor<float> tmp = valBuf.Get<float>();
-    tmp.SetValue(0, x);
-    PipeBarrier<PIPE_ALL>();
-    Sqrt(tmp, tmp, 1);
-    PipeBarrier<PIPE_ALL>();
-    float result = tmp.GetValue(0);
-    return result;
-}
 
 // ---- FP16 byte reinterpret ----
 
@@ -118,11 +91,8 @@ __aicore__ inline float KernelTqFusedDecode::ReadFp16AsFp32(
 }
 
 // ---- Tiling data read via DataCopy + GetValue ----
-// Tiling is at offset 0 in the combined buffer. No pointer arithmetic needed.
-// Centroids are at offset kTilingBufAligned (96 bytes = 24 floats) in the same buffer.
 
 __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR centroidsTiling) {
-    // Tiling is at the START of the combined buffer — no offset needed
     GlobalTensor<int32_t> tilingGm;
     tilingGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(centroidsTiling));
 
@@ -131,7 +101,6 @@ __aicore__ inline void KernelTqFusedDecode::ReadTiling(GM_ADDR centroidsTiling) 
     DataCopy(slotLocal, tilingGm, kTilingInt32Count);
     PipeBarrier<PIPE_ALL>();
 
-    // (removed per-core tiling dump — too verbose in production)
     tiling.batchSize       = slotLocal.GetValue(0);
     tiling.numQueryHeads   = slotLocal.GetValue(1);
     tiling.numKvHeads      = slotLocal.GetValue(2);
@@ -167,17 +136,16 @@ __aicore__ inline void KernelTqFusedDecode::Init(
 
     uint32_t blockIdx = GetBlockIdx();
 
-    // Init UB buffers
     pipe.InitBuffer(slotQueue, 1, SLOT_QUEUE_BUF);
     pipe.InitBuffer(queryBuf, QUERY_BUF_SIZE);
     pipe.InitBuffer(centroidBuf, CENTROID_BUF_SIZE);
     pipe.InitBuffer(accBuf, ACC_BUF_SIZE);
     pipe.InitBuffer(valBuf, VAL_BUF_SIZE);
-    pipe.InitBuffer(weightedBuf, WEIGHTED_BUF_SIZE);
+    pipe.InitBuffer(productBuf, PRODUCT_BUF_SIZE);
+    pipe.InitBuffer(workBuf, WORK_BUF_SIZE);
 
     ReadTiling(centroidsTiling);
 
-    // Early exit if this core has no work
     if (blockIdx >= tiling.gridSize) return;
 
     batchIdx_ = blockIdx / tiling.numQueryHeads;
@@ -185,25 +153,22 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     kvHead_ = qheadIdx_ / tiling.gqaRatio;
 
     // Bind GM tensors
-    // Centroids are at float offset 24 (96 bytes) in the combined buffer,
-    // after the tiling data (96 bytes = 24 int32).
     queryRotGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(queryRot));
     kvCacheGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(kvCache));
     blockTableGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(blockTable));
     seqLensGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLens));
+    // Centroids start after tiling data (96 bytes = 24 float offsets)
     centroidsGm.SetGlobalBuffer(
-        reinterpret_cast<__gm__ float*>(centroidsTiling) + 24);  // skip 96 bytes of tiling
+        reinterpret_cast<__gm__ float*>(centroidsTiling) + 24);
     outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(output));
 
-    // Store raw base addresses for offset-based DataCopy
     queryRotBase_ = queryRot;
     kvCacheBase_ = kvCache;
     outputBase_ = output;
 
     seqLen_ = static_cast<uint32_t>(seqLensGm.GetValue(batchIdx_));
 
-    // Load query as fp16, then Cast to fp32 for computation.
-    // The host always sends fp16 query (via .to(torch.float16)).
+    // Load query as fp16, then Cast to fp32 for computation
     uint64_t qOffset = static_cast<uint64_t>(batchIdx_) * tiling.numQueryHeads * tiling.headDim
                      + static_cast<uint64_t>(qheadIdx_) * tiling.headDim;
     GlobalTensor<half> queryFp16Gm;
@@ -216,16 +181,6 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     Cast(queryFp32, queryFp16, RoundMode::CAST_ROUND, HEAD_DIM);
     pipe_barrier(PIPE_V);
     slotQueue.FreeTensor(queryFp16);
-
-    // DIAG: verify query + tiling for head 19
-    if (blockIdx == 19) {
-        auto q = queryBuf.Get<float>();
-        AscendC::printf("TQ-DIAG-H19 init q[%d][%d] cast[0:3]=%f %f %f %f q60=%f q120=%f seq=%d smSc=%f nCorr=%d\n",
-                         batchIdx_, qheadIdx_,
-                         q.GetValue(0), q.GetValue(1), q.GetValue(2), q.GetValue(3),
-                         q.GetValue(60), q.GetValue(120),
-                         seqLen_, tiling.smScale, tiling.normCorrection);
-    }
 
     // Load centroid table (16 fp32)
     auto centroidLocal = centroidBuf.Get<float>();
@@ -242,113 +197,125 @@ __aicore__ inline void KernelTqFusedDecode::Init(
     runningSum_ = 0.0f;
 }
 
-// ---- Score + online softmax + value dequant + accumulate ----
+// ---- Vectorized score computation + online softmax + value accumulate ----
+//
+// Pipeline per token:
+//   1. Scalar SetValue: gather 128 centroid values by 4-bit key indices → valBuf
+//   2. Vector Mul + ReduceSum: normSq = sum(centroid^2)              → productBuf
+//   3. Vector Mul + ReduceSum: rawScore = sum(query * centroid)      → productBuf
+//   4. Scalar Sqrt via workBuf: normalize rawScore
+//   5. Vector Exp(2): batched alpha + weight                         → workBuf
+//   6. Vector Muls: acc *= alpha
+//   7. DequantValueAndAccumulate: unpack + dequant + accumulate
 
 __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
     LocalTensor<uint8_t>& slotUb) {
     auto queryLocal = queryBuf.Get<float>();
     auto centroidLocal = centroidBuf.Get<float>();
+    auto gathered = valBuf.Get<float>();
+    auto product = productBuf.Get<float>();
+    auto work = workBuf.Get<float>();
 
-    float rawScore = 0.0f;
+    // Phase 1: Gather centroids by 4-bit key indices (scalar SetValue — pure stores,
+    // no accumulation, compiler will not apply reduction auto-vectorization).
+    for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
+        uint8_t packed = slotUb.GetValue(byteIdx);
+        gathered.SetValue(byteIdx * 2 + 0, centroidLocal.GetValue(packed & 0xF));
+        gathered.SetValue(byteIdx * 2 + 1, centroidLocal.GetValue((packed >> 4) & 0xF));
+    }
+    PipeBarrier<PIPE_ALL>();
+
+    // Phase 2: normSq = sum(centroid^2) — computed before rawScore overwrites productBuf
     float normSq = 0.0f;
-
-    // DIAG: verify rawScore starts at 0 and print first term for head 19 token 0
-    bool diagHead19 = (GetBlockIdx() == 19 && curTokenPos_ == 0);
-
     if (tiling.normCorrection) {
-        for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
-            uint8_t packed = slotUb.GetValue(byteIdx);
-            uint32_t loIdx = packed & 0xF;
-            uint32_t hiIdx = (packed >> 4) & 0xF;
-            float cLo = centroidLocal.GetValue(loIdx);
-            float cHi = centroidLocal.GetValue(hiIdx);
-            float qLo = queryLocal.GetValue(byteIdx * 2 + 0);
-            float qHi = queryLocal.GetValue(byteIdx * 2 + 1);
-            float term = qLo * cLo + qHi * cHi;
-
-            if (diagHead19 && byteIdx < 4) {
-                AscendC::printf("TQ-DIAG-H19 T%02d pk=%d lo=%d hi=%d cL=%f cH=%f qL=%f qH=%f term=%f rawSc=%f\n",
-                                 byteIdx, (int)packed, (int)loIdx, (int)hiIdx,
-                                 cLo, cHi, qLo, qHi, term, rawScore);
-            }
-
-            rawScore += term;
-            normSq += cLo * cLo + cHi * cHi;
-        }
-        rawScore *= 1.0f / ScalarSqrt(normSq + 1e-16f);
-    } else {
-        for (uint32_t byteIdx = 0; byteIdx < MSE_BYTES; byteIdx++) {
-            uint8_t packed = slotUb.GetValue(byteIdx);
-            uint32_t loIdx = packed & 0xF;
-            uint32_t hiIdx = (packed >> 4) & 0xF;
-            float cLo = centroidLocal.GetValue(loIdx);
-            float cHi = centroidLocal.GetValue(hiIdx);
-            float qLo = queryLocal.GetValue(byteIdx * 2 + 0);
-            float qHi = queryLocal.GetValue(byteIdx * 2 + 1);
-            rawScore += qLo * cLo + qHi * cHi;
-        }
+        Mul(product, gathered, gathered, HEAD_DIM);
+        pipe_barrier(PIPE_V);
+        ReduceSum(product, product, work, HEAD_DIM);
+        PipeBarrier<PIPE_ALL>();
+        normSq = product.GetValue(0);
     }
 
+    // Phase 3: rawScore = sum(query * centroid)
+    Mul(product, queryLocal, gathered, HEAD_DIM);
+    pipe_barrier(PIPE_V);
+    ReduceSum(product, product, work, HEAD_DIM);
+    PipeBarrier<PIPE_ALL>();
+    float rawScore = product.GetValue(0);
+
+    // Phase 4: Normalize rawScore /= sqrt(normSq + eps)
+    if (tiling.normCorrection) {
+        work.SetValue(0, normSq + 1e-16f);
+        PipeBarrier<PIPE_ALL>();
+        Sqrt(work, work, 1);
+        PipeBarrier<PIPE_ALL>();
+        rawScore /= work.GetValue(0);
+    }
+
+    // Phase 5: Final attention score = rawScore * vecNorm * smScale
     float vecNorm = ReadFp16AsFp32(slotUb, MSE_BYTES);
     float score = rawScore * vecNorm * tiling.smScale;
 
-    // DIAG: print score details for head 19
-    if (GetBlockIdx() == 19 && (curTokenPos_ == 0 || curTokenPos_ == seqLen_ - 1 ||
-                                 score > 100.0f || score < -100.0f)) {
-        AscendC::printf("TQ-DIAG-H19 SCORE tok=%d rawSc=%f nSq=%f vn=%f smSc=%f score=%f\n",
-                         curTokenPos_, rawScore, normSq, vecNorm, tiling.smScale, score);
+#if TQ_KERNEL_DEBUG
+    if (GetBlockIdx() == 19 && (curTokenPos_ == 0 || curTokenPos_ == seqLen_ - 1)) {
+        AscendC::printf("TQ-VEC SCORE tok=%d rawSc=%f nSq=%f vn=%f score=%f\n",
+                         curTokenPos_, rawScore, normSq, vecNorm, score);
     }
+#endif
 
-    // Online softmax update
+    // Phase 6: Online softmax — batched vector Exp for both alpha and weight
     float newMax = (score > runningMax_) ? score : runningMax_;
-    float alpha = ScalarExp(runningMax_ - newMax);
-    float weight = ScalarExp(score - newMax);
+    work.SetValue(0, runningMax_ - newMax);  // alpha input
+    work.SetValue(1, score - newMax);        // weight input
+    PipeBarrier<PIPE_ALL>();
+    Exp(work, work, 2);
+    PipeBarrier<PIPE_ALL>();
+    float alpha = work.GetValue(0);
+    float weight = work.GetValue(1);
 
     runningSum_ = runningSum_ * alpha + weight;
 
-    // Scale accumulator: acc *= alpha
+    // Phase 7: Scale accumulator: acc *= alpha
     auto accLocal = accBuf.Get<float>();
     Muls(accLocal, accLocal, alpha, HEAD_DIM);
     pipe_barrier(PIPE_V);
 
-    // Dequantize value and accumulate
+    // Phase 8: Dequantize value and accumulate
     DequantValueAndAccumulate(slotUb, weight);
 
     runningMax_ = newMax;
 }
 
+// ---- Value dequantization + accumulation ----
+// Value uses uniform (linear) quantization: val = index * scale + zero
+// The 4-bit indices are NOT centroid lookups, they are integer indices 0-15.
+
 __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
     LocalTensor<uint8_t>& slotUb, float weight) {
     auto valLocal = valBuf.Get<float>();
     auto accLocal = accBuf.Get<float>();
-    auto weightedLocal = weightedBuf.Get<float>();
+    auto productLocal = productBuf.Get<float>();
 
-    // Unpack 4-bit value indices into float
+    // Unpack 4-bit value indices into float (scalar SetValue — pure stores, safe)
     for (uint32_t byteIdx = 0; byteIdx < VAL_DATA_BYTES; byteIdx++) {
         uint8_t packed = slotUb.GetValue(KEY_PACKED_SIZE + byteIdx);
         valLocal.SetValue(byteIdx * 2 + 0, static_cast<float>(packed & 0xF));
         valLocal.SetValue(byteIdx * 2 + 1, static_cast<float>((packed >> 4) & 0xF));
     }
-    // SetValue goes through the Scalar pipe; the subsequent Muls/Adds below
-    // run on the Vector pipe and read valLocal from UB. Without PIPE_ALL,
-    // the Vector unit can observe stale UB contents (the SetValue writes
-    // are still in flight on the Scalar pipe). This was the most likely
-    // root cause of the constant ±1.430 fused-output pattern.
     PipeBarrier<PIPE_ALL>();
 
     float vScale = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES);
     float vZero = ReadFp16AsFp32(slotUb, KEY_PACKED_SIZE + VAL_DATA_BYTES + 2);
 
-    // Dequantize: val = val * scale + zero
+    // Dequantize: val = index * scale + zero
     Muls(valLocal, valLocal, vScale, HEAD_DIM);
     pipe_barrier(PIPE_V);
     Adds(valLocal, valLocal, vZero, HEAD_DIM);
     pipe_barrier(PIPE_V);
 
     // acc += weight * val
-    Muls(weightedLocal, valLocal, weight, HEAD_DIM);
+    Muls(productLocal, valLocal, weight, HEAD_DIM);
     pipe_barrier(PIPE_V);
-    Add(accLocal, accLocal, weightedLocal, HEAD_DIM);
+    Add(accLocal, accLocal, productLocal, HEAD_DIM);
     pipe_barrier(PIPE_V);
 }
 
@@ -357,7 +324,7 @@ __aicore__ inline void KernelTqFusedDecode::DequantValueAndAccumulate(
 __aicore__ inline void KernelTqFusedDecode::Process() {
     if (GetBlockIdx() >= tiling.gridSize) return;
 
-    // Handle empty sequence
+    // Handle empty sequence — output zeros
     if (seqLen_ == 0) {
         auto accLocal = accBuf.Get<float>();
         auto slotOut = slotQueue.AllocTensor<uint8_t>();
@@ -402,18 +369,19 @@ __aicore__ inline void KernelTqFusedDecode::Process() {
     // Final normalization: output = acc / runningSum
     auto accLocal = accBuf.Get<float>();
 
-    // DIAG: head 19 final state
+#if TQ_KERNEL_DEBUG
     if (GetBlockIdx() == 19) {
-        AscendC::printf("TQ-DIAG-H19 FINAL max=%f sum=%f acc0=%f acc1=%f\n",
+        AscendC::printf("TQ-VEC FINAL max=%f sum=%f acc0=%f acc1=%f\n",
                          runningMax_, runningSum_,
                          accLocal.GetValue(0), accLocal.GetValue(1));
     }
+#endif
 
     float invSum = 1.0f / runningSum_;
     Muls(accLocal, accLocal, invSum, tiling.headDim);
     pipe_barrier(PIPE_V);
 
-    // Cast fp32 → fp16 and write output
+    // Cast fp32 -> fp16 and write output
     auto outFp16 = slotLocal.ReinterpretCast<half>();
     Cast(outFp16, accLocal, RoundMode::CAST_ROUND, tiling.headDim);
     pipe_barrier(PIPE_V);
