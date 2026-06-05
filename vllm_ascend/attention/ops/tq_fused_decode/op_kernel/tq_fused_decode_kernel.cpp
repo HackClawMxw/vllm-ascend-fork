@@ -225,11 +225,32 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
     }
     PipeBarrier<PIPE_ALL>();
 
+#if TQ_KERNEL_DEBUG
+    // DIAG-STEP1: verify gathered centroids after SetValue loop
+    if (GetBlockIdx() == 19 && curTokenPos_ == 0) {
+        AscendC::printf("TQ-S1 gathered[0:4]=%f %f %f %f q[0:4]=%f %f %f %f\n",
+            gathered.GetValue(0), gathered.GetValue(1),
+            gathered.GetValue(2), gathered.GetValue(3),
+            queryLocal.GetValue(0), queryLocal.GetValue(1),
+            queryLocal.GetValue(2), queryLocal.GetValue(3));
+    }
+#endif
+
     // Phase 2: normSq = sum(centroid^2) — computed before rawScore overwrites productBuf
     float normSq = 0.0f;
     if (tiling.normCorrection) {
         Mul(product, gathered, gathered, HEAD_DIM);
         pipe_barrier(PIPE_V);
+
+#if TQ_KERNEL_DEBUG
+        // DIAG-STEP2: verify centroid^2 products
+        if (GetBlockIdx() == 19 && curTokenPos_ == 0) {
+            AscendC::printf("TQ-S2 c^2[0:4]=%f %f %f %f\n",
+                product.GetValue(0), product.GetValue(1),
+                product.GetValue(2), product.GetValue(3));
+        }
+#endif
+
         ReduceSum(product, product, work, HEAD_DIM);
         PipeBarrier<PIPE_ALL>();
         normSq = product.GetValue(0);
@@ -238,6 +259,16 @@ __aicore__ inline void KernelTqFusedDecode::ComputeScoreAndAccumulate(
     // Phase 3: rawScore = sum(query * centroid)
     Mul(product, queryLocal, gathered, HEAD_DIM);
     pipe_barrier(PIPE_V);
+
+#if TQ_KERNEL_DEBUG
+    // DIAG-STEP3: verify query*centroid products BEFORE ReduceSum
+    if (GetBlockIdx() == 19 && curTokenPos_ == 0) {
+        AscendC::printf("TQ-S3 q*c[0:4]=%f %f %f %f\n",
+            product.GetValue(0), product.GetValue(1),
+            product.GetValue(2), product.GetValue(3));
+    }
+#endif
+
     ReduceSum(product, product, work, HEAD_DIM);
     PipeBarrier<PIPE_ALL>();
     float rawScore = product.GetValue(0);
