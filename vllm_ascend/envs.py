@@ -36,6 +36,10 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental A5 MRV2 shared eager/graph route through the external
+    # cann_ops_transformer FlashMLA two-stage API. Disabled by default and
+    # non-sensitive. Valid values: 0 or 1.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_MLA"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
