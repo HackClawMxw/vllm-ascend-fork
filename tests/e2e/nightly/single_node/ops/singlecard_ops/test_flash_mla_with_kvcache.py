@@ -343,9 +343,9 @@ class _TupleLinear(torch.nn.Module):
         return F.linear(x, self.weight, self.bias), None
 
 
-def _make_layer(*, gate, bias, fused):
+def _make_layer(*, gate, bias, fused, heads=HEADS_Q):
     impl = mla_v1.AscendMLAImpl.__new__(mla_v1.AscendMLAImpl)
-    impl.num_heads = HEADS_Q
+    impl.num_heads = heads
     impl.num_kv_heads = 1
     impl.kv_lora_rank = V_DIM
     impl.qk_nope_head_dim = 128
@@ -358,13 +358,13 @@ def _make_layer(*, gate, bias, fused):
     impl.use_output_gate = gate
     impl.fused_qkv_a_proj = _TupleLinear(64, 64 + QK_DIM) if fused else None
     impl.kv_a_proj_with_mqa = None if fused else _TupleLinear(64, QK_DIM)
-    impl.q_proj = _TupleLinear(64, HEADS_Q * impl.qk_head_dim)
+    impl.q_proj = _TupleLinear(64, heads * impl.qk_head_dim)
     impl.q_a_layernorm = torch.nn.RMSNorm(64, eps=1e-6, dtype=torch.bfloat16, device="npu")
     impl.kv_a_layernorm = torch.nn.RMSNorm(V_DIM, eps=1e-6, dtype=torch.bfloat16, device="npu")
-    impl.W_UK_T = torch.randn(HEADS_Q, 128, V_DIM, dtype=torch.bfloat16, device="npu") * 0.02
-    impl.W_UV = torch.randn(HEADS_Q, V_DIM, 128, dtype=torch.bfloat16, device="npu") * 0.02
-    impl.g_proj = _TupleLinear(64, HEADS_Q * 128) if gate else None
-    impl.o_proj = _TupleLinear(HEADS_Q * 128, 64, bias=bias)
+    impl.W_UK_T = torch.randn(heads, 128, V_DIM, dtype=torch.bfloat16, device="npu") * 0.02
+    impl.W_UV = torch.randn(heads, V_DIM, 128, dtype=torch.bfloat16, device="npu") * 0.02
+    impl.g_proj = _TupleLinear(64, heads * 128) if gate else None
+    impl.o_proj = _TupleLinear(heads * 128, 64, bias=bias)
     return impl
 
 

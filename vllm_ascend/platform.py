@@ -656,8 +656,10 @@ def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
         errors.append("the installed Ascend target must be A5")
     if not vllm_config.use_v2_model_runner:
         errors.append("MRV2 must be enabled")
-    if not model_config.use_mla or model_config.is_hybrid:
-        errors.append("the model must use non-hybrid MLA")
+    # Hybrid K3 models dispatch KDA layers separately; this contract applies
+    # only to their MLA layers, not to the recurrent state backend.
+    if not model_config.use_mla:
+        errors.append("the model must use MLA")
     if model_uses_sfa_sparse(model_config):
         errors.append("sparse/SFA attention is unsupported")
     if model_config.dtype != torch.bfloat16:
@@ -666,8 +668,10 @@ def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
         errors.append(f"KV cache dtype must resolve to unquantized BF16, got {cache_config.cache_dtype}")
     if parallel_config.prefill_context_parallel_size != 1:
         errors.append("PCP size must be 1")
-    if parallel_config.decode_context_parallel_size != 1:
-        errors.append("DCP size must be 1")
+    if parallel_config.decode_context_parallel_size > 1 and (
+        parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size
+    ):
+        errors.append("external FlashMLA currently requires DCP size equal to TP size, or DCP=1")
     if KVPPConfig.from_vllm_config(vllm_config).size != 1:
         errors.append("KV layer parallelism is unsupported")
     if vllm_config.speculative_config is not None:

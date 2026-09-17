@@ -13,7 +13,7 @@ from copy import copy
 import torch
 import vllm.envs as envs
 from torch import nn
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    DCPGroupColumnParallelLinear,
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -78,6 +79,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
 from vllm_ascend.utils import get_rotation_path
 
@@ -278,6 +280,29 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
             prefix=prefix,
         )
         attention_layer = self._attention_layer
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            parallel_config = get_current_vllm_config().parallel_config
+            qrep_requested = (
+                envs.VLLM_DCP_Q_REPLICATE if envs.is_set("VLLM_DCP_Q_REPLICATE") else parallel_config.dcp_q_replicate
+            )
+            if (
+                qrep_requested
+                and parallel_config.decode_context_parallel_size > 1
+                and parallel_config.prefill_context_parallel_size == 1
+            ):
+                # PR #5's group-sharded projection, installed before checkpoint
+                # loading. V-up, gate and O projection remain TP-local.
+                name = "q_b_proj" if q_lora_rank is not None else "q_proj"
+                projection = DCPGroupColumnParallelLinear(
+                    q_lora_rank if q_lora_rank is not None else hidden_size,
+                    num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.{name}",
+                )
+                setattr(self, name, projection)
+                attention_layer.impl.q_proj = projection
+                attention_layer.impl.enable_mlapo = False
         if disable_mlapo:
             attention_layer.impl.enable_mlapo = False
         if not use_rope and not non_causal_multi_token_decode:

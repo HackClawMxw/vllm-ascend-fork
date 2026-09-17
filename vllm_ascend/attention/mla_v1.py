@@ -29,6 +29,8 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.flash_mla import (
     FlashMLAMetadata,
     build_flash_mla_metadata,
+    combine_flash_mla_output,
+    exchange_flash_mla_output,
     flash_mla_with_kvcache,
     init_flash_mla_metadata,
     validate_flash_mla_kv_cache,
@@ -346,6 +348,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                         f"A5 FlashMLA group {name} has (Q heads, KV heads, latent dim, RoPE dim) "
                         f"{dims}, expected {expected}."
                     )
+                if getattr(impl, "dcp_q_replicate", False) != getattr(first_impl, "dcp_q_replicate", False):
+                    raise ValueError("FlashMLA layers sharing metadata must have the same Q replication mode.")
             init_flash_mla_metadata(self, first_impl)
 
     def enable_device_metadata(self) -> None:
@@ -2151,14 +2155,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         q_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         c_kv, k_pe = kv.view(num_tokens, 1, 576).split([512, 64], dim=-1)
         c_kv = self.kv_a_layernorm(c_kv.contiguous()).view(num_tokens, 1, 512)  # type: ignore[misc]
-        if not self.use_mla_rope:
-            raise ValueError("A5 FlashMLA requires the real 64-dimensional MLA RoPE path.")
-        cos, sin = get_cos_and_sin_mla(flash.positions, use_cache=False)
-        q_pe = self.rope_single(q_pe, cos, sin)
-        k_pe = self.rope_single(k_pe, cos, sin)
+        # K3 NoPE retains these 64 projected channels without rotating them.
+        # Both paths still supply the same 576-dimensional Q/K contract.
+        if self.use_mla_rope:
+            cos, sin = get_cos_and_sin_mla(flash.positions, use_cache=False)
+            q_pe = self.rope_single(q_pe, cos, sin)
+            k_pe = self.rope_single(k_pe, cos, sin)
         query = torch.cat((q_nope, q_pe), dim=-1)
         if query.dtype != torch.bfloat16:
             raise ValueError(f"A5 FlashMLA Q must be BF16, got {query.dtype}.")
+        if query.shape != flash.query.shape:
+            raise ValueError(f"FlashMLA actual Q shape {query.shape} does not match metadata {flash.query.shape}.")
         flash.query.copy_(query)
 
         validate_flash_mla_kv_cache(
@@ -2178,7 +2185,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         contract = flash.contract.with_softmax_scale(self.scale)
         record_attention_compute_start()
-        latent, _ = flash_mla_with_kvcache(
+        latent, lse = flash_mla_with_kvcache(
             flash.query,
             kv_cache,
             **contract.attention_kwargs(
@@ -2190,9 +2197,56 @@ class AscendMLAImpl(MLAAttentionImpl):
                 metadata=flash.schedule,
             ),
         )
-        expected_shape = (self.num_heads, num_tokens, self.kv_lora_rank)
+        expected_shape = (contract.num_heads_q, num_tokens, self.kv_lora_rank)
         if tuple(latent.shape) != expected_shape:
             raise RuntimeError(f"FlashMLA NTD output has shape {tuple(latent.shape)}, expected {expected_shape}.")
+        if contract.return_softmax_lse:
+            history = exchange_flash_mla_output(
+                latent,
+                lse,
+                flash.token_has_kv,
+                dcp_size=self.dcp_size,
+                dcp_device_group=self.dcp_device_group,
+            )
+            current_output = current_lse = None
+            if flash.current is not None:
+                current = flash.current
+                # All current tokens are resident here, including those whose
+                # persistent DCP slot is -1 because another rank owns it.
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key=c_kv.contiguous(),
+                    value=k_pe.contiguous(),
+                    key_cache=current.cache[..., :512],
+                    value_cache=current.cache[..., 512:],
+                    slot_mapping=current.slots,
+                    cache_mode="Norm",
+                )
+                current_output, current_lse = flash_mla_with_kvcache(
+                    flash.query,
+                    current.cache,
+                    **current.contract.with_softmax_scale(self.scale).attention_kwargs(
+                        block_table=current.block_table,
+                        cache_seqlens=flash.used_q,
+                        cu_seqlens_q=flash.cu,
+                        seqused_q=flash.used_q,
+                        attn_mask=current.attn_mask,
+                        metadata=current.schedule,
+                    ),
+                )
+                if tuple(current_output.shape) != expected_shape or tuple(current_lse.shape) != expected_shape[:2]:
+                    raise RuntimeError("FlashMLA current chunk must return group-head NTD output and NT LSE.")
+                # Unlike #1's native operator, the external operator requires
+                # 64/96 real Q heads in BOTH calls. Slice only after attention.
+                start = self.dcp_rank * self.num_heads
+                current_output = current_output[start : start + self.num_heads]
+                current_lse = current_lse[start : start + self.num_heads]
+            latent = combine_flash_mla_output(
+                history,
+                dtype=query.dtype,
+                current_output=current_output,
+                current_lse=current_lse,
+                token_live=flash.token_live,
+            )
 
         # The fused strided cache contract ends at NTD latent context.
         # Follow reference #1's no-merge V-up/gate/O-projection branches;

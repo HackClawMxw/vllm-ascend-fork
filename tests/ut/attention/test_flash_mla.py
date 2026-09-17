@@ -9,6 +9,7 @@ import vllm_ascend.attention.flash_mla as flash_mla
 import vllm_ascend.attention.mla_v1 as mla_v1
 import vllm_ascend.platform as ascend_platform
 from vllm_ascend import envs as ascend_envs
+from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl
 
 
 def _common(*, causal=True, num_input_tokens=6):
@@ -149,7 +150,7 @@ def test_supported_actual_q_heads(heads):
     assert flash_mla.FlashMLAContract(num_heads_q=heads, mask_mode=3).num_heads_q == heads
 
 
-@pytest.mark.parametrize("heads", [0, 16, 32, 128])
+@pytest.mark.parametrize("heads", [0, 12, 16, 24, 32, 128])
 def test_unsupported_actual_q_heads_fail(heads):
     with pytest.raises(ValueError, match="64 or 96"):
         flash_mla.FlashMLAContract(num_heads_q=heads, mask_mode=3)
@@ -235,6 +236,7 @@ def _valid_platform_config() -> SimpleNamespace:
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
+            tensor_parallel_size=4,
         ),
         speculative_config=None,
         kv_transfer_config=None,
@@ -258,6 +260,19 @@ def test_platform_contract_rejects_non_mrv2_and_quantized_cache(monkeypatch):
     invalid.cache_config.cache_dtype = "fp8"
     with pytest.raises(ValueError, match="MRV2.*KV cache dtype"):
         ascend_platform._validate_flash_mla_config(invalid)
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_platform_allows_mla_in_hybrid_models(monkeypatch, hybrid):
+    monkeypatch.setitem(ascend_envs.env_variables, "VLLM_ASCEND_ENABLE_FLASH_MLA", lambda: True)
+    monkeypatch.setattr("vllm_ascend.device.device_config.is_950", lambda: True)
+    monkeypatch.setattr(ascend_platform, "model_uses_sfa_sparse", lambda config: False)
+    config = _valid_platform_config()
+    config.model_config.is_hybrid = hybrid
+    ascend_platform._validate_flash_mla_config(config)
+    config.model_config.use_mla = False
+    with pytest.raises(ValueError, match="model must use MLA"):
+        ascend_platform._validate_flash_mla_config(config)
 
 
 @pytest.mark.parametrize("model_v_dim", [128, 256, 512])
@@ -311,3 +326,152 @@ def test_platform_allows_graph_mode(monkeypatch):
     config = _valid_platform_config()
     config.model_config.enforce_eager = False
     ascend_platform._validate_flash_mla_config(config)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("interleave", [1, 16, 128])
+def test_dcp_history_current_metadata(schedule_calls, rank, interleave):
+    builder, common = _builder(heads=96), _common()
+    builder.flash_dcp_size, builder.flash_dcp_rank, builder.flash_interleave_size = 4, rank, interleave
+    common.seq_lens.copy_(torch.tensor([260, 132], dtype=torch.int32))
+    common.slot_mapping[:4] = -1  # Remote ownership is NOT query padding.
+    flash = flash_mla.build_flash_mla_metadata(builder, common)
+    expected = [sum((i // interleave) % 4 == rank for i in range(n)) for n in (258, 130)]
+    assert flash.cache_lens.tolist() == expected + [0]
+    assert flash.token_has_kv.tolist() == [expected[0] > 0] * 2 + [expected[1] > 0] * 2 + [False] * 2
+    assert flash.used_q.tolist() == [2, 2, 0]
+    assert flash.contract.mask_mode == 0 and flash.attn_mask is None
+    current = flash.current
+    assert current is not None and current.cache.shape[1:] == (128, 1, 576)
+    assert current.slots.tolist() == [0, 1, 128, 129, -1, -1]
+    assert current.block_table[:, 0].tolist() == [0, 1, 0]
+    assert current.contract.num_heads_q == flash.contract.num_heads_q == 96
+    assert current.contract.mask_mode == 3
+    assert current.contract.return_softmax_lse and flash.contract.return_softmax_lse
+    assert len(schedule_calls) == 4
+    assert all(call[1] == 96 for call in schedule_calls)
+    assert schedule_calls[-2][0] is flash.used_q
+    assert schedule_calls[-2][3]["mask_mode"] == 3
+    assert schedule_calls[-1][0] is flash.cache_lens
+    assert schedule_calls[-1][3]["mask_mode"] == 0
+
+
+def test_dcp_decode_refreshes_both_schedules_with_one_fence(schedule_calls):
+    builder, common = _builder(heads=96, deferred=True), _common(num_input_tokens=4)
+    builder.flash_dcp_size, builder.flash_dcp_rank, builder.flash_interleave_size = 4, 1, 16
+    common.max_query_len = 1
+    common.num_actual_tokens = 2
+    common.query_start_loc.copy_(torch.tensor([0, 1, 2], dtype=torch.int32))
+    first = flash_mla.build_flash_mla_metadata(builder, common)
+    current = first.current
+    pointers = [
+        t.data_ptr() for t in (first.schedule, current.schedule, current.cache, current.slots, current.block_table)
+    ]
+    assert len(schedule_calls) == 2  # Only Meta; both real calls deferred.
+    (task,) = builder._device_metadata_tasks
+    common.seq_lens.copy_(torch.tensor([18, 0], dtype=torch.int32))
+    task.run()
+    assert first.cache_lens.tolist() == [1, 0, 0]
+    assert first.used_q.tolist() == [1, 0, 0]
+    assert current.slots.tolist() == [0, -1, -1, -1]
+    first_schedule, current_schedule = first.schedule.clone(), current.schedule.clone()
+    common.seq_lens.copy_(torch.tensor([33, 5], dtype=torch.int32))
+    second = flash_mla.build_flash_mla_metadata(builder, common)
+    assert second is first
+    (task,) = builder._device_metadata_tasks
+    assert task.group_id == id(first.schedule)
+    task.run()
+    assert pointers == [
+        t.data_ptr() for t in (first.schedule, current.schedule, current.cache, current.slots, current.block_table)
+    ]
+    assert first.cache_lens.tolist() == [16, 0, 0]
+    assert current.slots.tolist() == [0, 128, -1, -1]
+    assert not torch.equal(first.schedule, first_schedule)
+    assert not torch.equal(current.schedule, current_schedule)
+
+
+def test_dcp_noncausal_uses_full_local_cache_without_current(schedule_calls):
+    builder, common = _builder(heads=64), _common(causal=False)
+    builder.flash_dcp_size, builder.flash_dcp_rank, builder.flash_interleave_size = 4, 1, 1
+    flash = flash_mla.build_flash_mla_metadata(builder, common)
+    assert flash.current is None and flash.contract.mask_mode == 0
+    assert flash.cache_lens.tolist() == [1, 1, 0]
+    assert flash.contract.return_softmax_lse
+
+
+def test_dcp_merge_counts_current_once_and_handles_empty_shards():
+    # Three histories with masses 1, 2, 0; one current with mass 3. A common
+    # +1000 LSE offset also exercises numerical stability.
+    history = torch.zeros(3, 1, 2, 2)
+    history[..., -1] = -torch.inf
+    history[0, 0, 0] = torch.tensor([2.0, 1000.0])
+    history[1, 0, 0] = torch.tensor([5.0, 1000.0])
+    history[1, 0, 0, -1] += torch.log(torch.tensor(2.0))
+    result = flash_mla.combine_flash_mla_output(
+        history,
+        dtype=torch.float32,
+        current_output=torch.tensor([[[8.0], [float("nan")]]]),
+        current_lse=torch.tensor([[1000.0 + torch.log(torch.tensor(3.0)), float("nan")]]),
+        token_live=torch.tensor([True, False]),
+    )
+    torch.testing.assert_close(result, torch.tensor([[[6.0], [0.0]]]), atol=3e-4, rtol=0)
+
+
+def test_dcp_exchange_masks_empty_kv_using_lengths_not_lse_sentinel(monkeypatch):
+    def exchange(output, lse, **kwargs):
+        assert output.shape == (2, 4, 1)
+        assert torch.count_nonzero(output[1]) == 0
+        assert torch.isneginf(lse[1]).all()
+        # Rank-major receive order, as produced by the existing all-to-all.
+        return torch.cat((output.float(), lse), dim=-1)
+
+    monkeypatch.setattr(flash_mla, "_process_attn_out_lse", exchange)
+    output = torch.arange(8).view(4, 2, 1).to(torch.bfloat16)
+    lse = torch.zeros(4, 2)
+    lse[:, 1] = float("nan")
+    result = flash_mla.exchange_flash_mla_output(
+        output, lse, torch.tensor([True, False]), dcp_size=2, dcp_device_group=None
+    )
+    assert result.shape == (2, 2, 2, 2)
+    torch.testing.assert_close(result[:, :, 0, 0], torch.tensor([[0.0, 2.0], [4.0, 6.0]]))
+
+
+def test_dcp_projection_absorbs_full_group_k_weights(monkeypatch):
+    monkeypatch.setitem(ascend_envs.env_variables, "VLLM_ASCEND_ENABLE_FLASH_MLA", lambda: True)
+    impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+    impl.num_heads, impl.dcp_size = 24, 4
+    impl.qk_nope_head_dim, impl.qk_rope_head_dim, impl.qk_head_dim = 128, 64, 192
+    projected = torch.randn(2, 96, 192)
+
+    class Projection:
+        qrep_active = True
+
+        def __call__(self, x):
+            return projected.flatten(1), None
+
+    impl.q_proj = Projection()
+    impl.dcp_W_UK_T = torch.randn(96, 128, 512)
+    actual, rope = impl._q_proj_and_k_up_proj(None)
+    expected = torch.einsum("thd,hdv->thv", projected[..., :128], impl.dcp_W_UK_T)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(rope, projected[..., 128:])
+
+
+def test_dcp_weight_reload_preserves_group_weight_address(monkeypatch):
+    monkeypatch.setitem(ascend_envs.env_variables, "VLLM_ASCEND_ENABLE_FLASH_MLA", lambda: True)
+    impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+    impl.q_proj = SimpleNamespace(qrep_active=True)
+    impl.fa_quant_layer, impl.enable_mlapo = False, True
+    impl.W_UK_T = torch.randn(24, 128, 512)
+    impl.W_UV = torch.randn(24, 512, 128)
+    local_v = impl.W_UV
+    monkeypatch.setattr(mla_v1.AscendMLAImpl, "process_weights_after_loading", lambda *a: None)
+    monkeypatch.setattr(mla_v1.torch_npu, "npu_format_cast", lambda weight, _: weight)
+    impl._dcp_all_gather = lambda weight, dim: torch.cat([weight] * 4, dim=dim)
+    impl.process_weights_after_loading(torch.bfloat16)
+    ptr = impl.dcp_W_UK_T.data_ptr()
+    impl.W_UK_T.add_(1)
+    impl.process_weights_after_loading(torch.bfloat16)
+    assert impl.dcp_W_UK_T.data_ptr() == ptr
+    assert impl.W_UV is local_v and not impl.enable_mlapo
+    torch.testing.assert_close(impl.dcp_W_UK_T, torch.cat([impl.W_UK_T] * 4, dim=0))

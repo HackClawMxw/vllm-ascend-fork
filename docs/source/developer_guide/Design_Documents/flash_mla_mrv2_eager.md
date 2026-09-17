@@ -10,8 +10,10 @@ eager/graph metadata lifecycle, not an eager-only backend.
 The base is PR #16456 at `bfd8ff9aa87342e42b1160416506a422ca69bdc1`,
 with vLLM `84030bbe3d74d99bad477a3d2e37a973ccd8865c`.
 Reference #1 is PR #16468 at `48c8a870d6b376b1ff854d636a2babe543cb395b`.
-Its no-merge postprocessing and MRV2 metadata ownership pattern are retained.
-This is not a wholesale merge of its allocator, GQA, DCP, DSpark or MLAPO work.
+Its postprocessing and MRV2 metadata ownership pattern are retained.
+DCP query replication follows maoxx241/vllm-ascend PR #5 at
+`63f12e209287c444d08f16ae8aaf9bfd6c561632`, also present in that reference.
+This is not a wholesale merge of its allocator, GQA, DSpark or MLAPO work.
 
 The supplied September 16 Torch API specification for
 `flash_mla_with_kvcache` governs the external boundary. The package is the
@@ -20,7 +22,10 @@ has not been executed on NPU; eager, graph and full-model acceptance are pending
 
 ## External contract
 
-- A5, MRV2, dense non-hybrid MLA, BF16, real 64-dimensional MLA RoPE.
+- A5, MRV2, dense MLA, BF16, 64 projected RoPE channels. K3 hybrid MLA/KDA
+  models are allowed: only MLA layers use this adapter; KDA is unchanged.
+  NoPE layers preserve the 64 channels without rotation; RoPE layers rotate
+  using real positions.
 - Actual operator Q head count 64 or 96, one KV head, QK576 and latent V512.
   With DCP disabled this is the local Q head count, not the model-global count.
 - TND Q, PA_BBND cache `[P,128,1,576]`, NTD output `[H,T,512]`.
@@ -33,7 +38,8 @@ has not been executed on NPU; eager, graph and full-model acceptance are pending
 - Load both public wrappers from `cann_ops_transformer.ops`.
   Missing entry points or metadata Meta support fail explicitly; there is no
   native fallback, invented schedule or hardcoded device-core count.
-- PCP/DCP=1, no KV-layer parallelism, speculative decoding, PD/KV transfer,
+- PCP=1, DCP=1 or DCP=TP with a replicated Q projection; no KV-layer parallelism,
+  speculative decoding, PD/KV transfer,
   sparse/compressed attention or quantized KV.
 
 Only the kernel page is fixed to 128. Manager/interleave size and the physical
@@ -41,7 +47,7 @@ page stride remain owned by #16456. Q heads are never padded to evade the API.
 
 ## Data and graph lifecycle
 
-The stable-buffer implementation follows reference #1's non-DCP path:
+The stable-buffer implementation follows reference #1's ownership model:
 
 1. Keep query, schedule, CU, used-Q, cache lengths, block table, slots, live
    mask and positions in buffers keyed by requests, token capacity, table
@@ -79,6 +85,45 @@ offset; inner dimensions are dense. There is no full-cache concatenation,
 contiguous copy or repack. Allocation, strided view construction, zeroing and
 COW are unchanged.
 
+## DCP and TP
+
+For K3, enable `VLLM_DCP_Q_REPLICATE=1` together with
+`VLLM_ASCEND_ENABLE_FLASH_MLA=1` and equal TP/DCP sizes (for example
+`--tensor-parallel-size 4 --decode-context-parallel-size 4`). Keep
+`--enforce-eager` for the first runtime check. No topology is changed implicitly.
+With the switch disabled, the K3 projection and legacy attention stay unchanged.
+
+The Q projection is replaced before checkpoint loading with
+`DCPGroupColumnParallelLinear`. For 96 global heads and TP=DCP=4, each rank
+produces 96 actual Q heads, while V-up/gate/O retain their 24-head TP shards.
+K-up absorption weights are gathered once after weight loading; reloading
+updates their existing allocation. A missing replicated projection or a group
+head count other than 64/96 fails rather than padding or mislabeling Q.
+
+For causal attention the layer computes two disjoint parts:
+
+| Part | KV lengths and storage | Q heads | Mask | Output handling |
+| --- | --- | --- | --- | --- |
+| History | Global `seq_lens - used_q`, partitioned by DCP interleave; original BBND cache | Group heads | 0 | Exchange history shards into TP-local head ownership |
+| Current | `used_q`; temporary replicated BBND pages written by this layer | Group heads | 3 | Slice output/LSE into TP-local heads **after** the operator |
+
+Both external calls return NTD latent output and FP32 NT LSE. Unlike the native
+current-block path in reference #1, neither external call receives 12/24 local heads.
+The merge counts every history shard and exactly one current chunk, then passes
+local NTD latent output to V-up/gate/O. The existing FP32 DCP all-to-all is reused;
+the LSE merge is deliberately unfused PyTorch, not #1's SFA Triton optimization.
+Its graph compatibility and cost still require real execution evidence.
+Known-empty history shards are masked from device lengths, without relying on
+an undocumented native LSE sentinel. Noncausal DCP reads the full local cache
+with mask 0 and has no separate current chunk.
+
+Both schedules, current page table/slots and history lengths refresh in one
+graph-external task/frontier. Decode buckets preserve both schedule addresses
+and the current scratch cache address. MRV2 submit/wait and the post-consumer
+reuse fence cover them together. The DCP subclass bypasses the old FIA graph
+update hook for the same reason as the base class; it does not skip metadata
+refresh. No additional runner stream or PD scheduling changes are introduced.
+
 ## Output processing
 
 After NTD attention output, V-up maps latent512 to the model value width.
@@ -102,6 +147,8 @@ Run the following only on the prepared A5 environment with the delivered package
 pytest -q tests/ut/attention/test_flash_mla.py
 pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_flash_mla_with_kvcache.py
 pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_flash_attention_output.py
+torchrun --standalone --nproc-per-node=4 -m pytest -xq \
+  tests/e2e/nightly/single_node/ops/multicard_ops_a5/test_flash_mla_dcp.py
 ```
 
 Coverage includes 64/96 Q heads, 128-token pages, stride/offset/page-gap guards,
@@ -114,6 +161,12 @@ weight loading or distributed linear layers.
 A real synthetic-layer graph test refreshes lengths, page mappings and inactive
 requests in the same bucket, verifies stable pointers and compares replay
 against eager. It is not a full MRV2 runner/model graph test.
+
+The multi-rank synthetic-layer test exercises real external calls and HCCL with
+64/96 group heads, interleave 1/16, empty history, mixed requests, page crossing,
+inactive rows, strided writes and stable-address decode replay. Its oracle is
+unpartitioned CPU attention. It does not validate checkpoint weight loading,
+the actual #16456 allocator, or the full hybrid K3 MRV2 runner.
 
 The acceptance tolerances remain `atol=rtol=0.02`; cache writes and protected
 storage must match exactly. Eager single-/multi-rank model smoke, real MRV2

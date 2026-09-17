@@ -3,8 +3,8 @@
 
 """External MLA adapter; stable-buffer lifecycle follows PR #16468 (48c8a870).
 
-Only the non-DCP, absorbed MLA path is selected here. Cache storage remains
-owned by MRV2 (#16456); this module never allocates or repacks persistent KV.
+Cache storage remains owned by MRV2 (#16456); this module never allocates or
+repacks persistent KV. DCP uses a separate batch-owned current-chunk cache.
 """
 
 from collections.abc import Callable
@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from vllm_ascend.attention.context_parallel.common_cp import _process_attn_out_lse, get_dcp_local_seq_lens
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
 
 
@@ -92,6 +93,18 @@ class FlashMLAContract:
 
 
 @dataclass
+class FlashMLACurrentMetadata:
+    """Replicated current chunk, counted once after the history exchange."""
+
+    cache: torch.Tensor
+    block_table: torch.Tensor
+    slots: torch.Tensor
+    schedule: torch.Tensor
+    attn_mask: torch.Tensor
+    contract: FlashMLAContract
+
+
+@dataclass
 class FlashMLAMetadata:
     """Stable inputs updated outside the model graph, as in reference #1."""
 
@@ -110,6 +123,8 @@ class FlashMLAMetadata:
     kv_capacity: int
     is_prefill: bool
     contract: FlashMLAContract
+    token_has_kv: torch.Tensor
+    current: FlashMLACurrentMetadata | None = None
 
 
 @lru_cache
@@ -139,17 +154,20 @@ def flash_mla_with_kvcache(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, tor
     return attention_op(*args, **kwargs)
 
 
-def _flash_mla_schedule(flash: FlashMLAMetadata, *, meta: bool = False) -> torch.Tensor:
+def _flash_mla_schedule(flash: FlashMLAMetadata, *, meta: bool = False, current: bool = False) -> torch.Tensor:
     """Ask the same operator for sizing and real scheduling; do not guess core counts."""
 
     def tensor(value):
         return torch.empty_like(value, device="meta") if meta else value
 
+    inputs = flash.current if current else flash
+    assert inputs is not None
+    lengths = flash.used_q if current else flash.cache_lens
     result = flash_mla_with_kvcache_metadata(
-        tensor(flash.cache_lens),
-        flash.contract.num_heads_q,
-        flash.contract.num_heads_kv,
-        **flash.contract.metadata_kwargs(tensor(flash.cu), tensor(flash.used_q)),
+        tensor(lengths),
+        inputs.contract.num_heads_q,
+        inputs.contract.num_heads_kv,
+        **inputs.contract.metadata_kwargs(tensor(flash.cu), tensor(flash.used_q)),
     )
     if result.dtype != torch.int32 or result.ndim != 1 or result.numel() == 0:
         raise RuntimeError("External FlashMLA metadata must be a non-empty one-dimensional int32 tensor.")
@@ -161,10 +179,16 @@ def _flash_mla_schedule(flash: FlashMLAMetadata, *, meta: bool = False) -> torch
 
 def init_flash_mla_metadata(builder: Any, impl: Any) -> None:
     ensure_flash_mla_ops_loaded()
-    # Validate the actual per-rank Q head count; never replace it with a
-    # model-global count or pad Q to make an unsupported geometry pass.
-    FlashMLAContract(num_heads_q=impl.num_heads, mask_mode=3)
-    builder.flash_num_heads = impl.num_heads
+    # The replicated projection produces real DCP-group heads, not a padded
+    # tensor or a model-global number substituted into metadata.
+    dcp_size = getattr(impl, "dcp_size", 1)
+    if dcp_size > 1 and not impl.dcp_q_replicate:
+        raise ValueError("External FlashMLA DCP requires a replicated Q projection; enable VLLM_DCP_Q_REPLICATE=1.")
+    builder.flash_num_heads = impl.num_heads * dcp_size
+    FlashMLAContract(num_heads_q=builder.flash_num_heads, mask_mode=3)
+    builder.flash_dcp_size = dcp_size
+    builder.flash_dcp_rank = getattr(impl, "dcp_rank", 0)
+    builder.flash_interleave_size = builder.vllm_config.parallel_config.cp_kv_cache_interleave_size
     builder._flash_buffers = {}
     builder._flash_attn_mask = torch.triu(torch.ones((2048, 2048), dtype=torch.int8, device=builder.device), diagonal=1)
 
@@ -180,6 +204,8 @@ def build_flash_mla_metadata(builder: Any, common: Any) -> FlashMLAMetadata:
     batch = common.num_reqs
     tokens = max(common.num_actual_tokens, common.num_input_tokens)
     table = common.block_table_tensor[:batch]
+    dcp_size = getattr(builder, "flash_dcp_size", 1)
+    split_current = dcp_size > 1 and common.causal
     block_size = builder.kernel_block_size or builder.kv_cache_spec.block_size
     if block_size != 128:
         raise ValueError("External FlashMLA requires kernel block size 128, not the manager/interleave size.")
@@ -221,16 +247,41 @@ def build_flash_mla_metadata(builder: Any, common: Any) -> FlashMLAMetadata:
             live_boundaries=torch.zeros(tokens + 1, **int_args),
             token_live=torch.zeros(tokens, dtype=torch.bool, device=builder.device),
             positions=torch.zeros(tokens, dtype=torch.int64, device=builder.device),
-            attn_mask=builder._flash_attn_mask if common.causal else None,
+            attn_mask=builder._flash_attn_mask if common.causal and not split_current else None,
             query_capacity=tokens,
             kv_capacity=table.shape[1] * block_size,
             is_prefill=common.max_query_len > builder.decode_threshold,
-            contract=FlashMLAContract(num_heads_q=builder.flash_num_heads, mask_mode=3 if common.causal else 0),
+            contract=FlashMLAContract(
+                num_heads_q=builder.flash_num_heads,
+                mask_mode=3 if common.causal and not split_current else 0,
+                return_softmax_lse=dcp_size > 1,
+            ),
+            token_has_kv=torch.zeros(tokens, dtype=torch.bool, device=builder.device),
         )
         flash = buffers[key]
+        if split_current:
+            # Each request starts on a page boundary. Sum(ceil(q_i/128))
+            # fits in ceil(total/128) + rows, including the padding row.
+            columns = max(1, (tokens + block_size - 1) // block_size)
+            flash.current = FlashMLACurrentMetadata(
+                cache=torch.empty(
+                    (columns + rows, block_size, 1, 576),
+                    dtype=builder.kv_cache_spec.dtype,
+                    device=builder.device,
+                ),
+                block_table=torch.zeros((rows, columns), **int_args),
+                slots=torch.full((tokens,), -1, dtype=torch.int64, device=builder.device),
+                schedule=torch.empty(0, **int_args),
+                attn_mask=builder._flash_attn_mask,
+                contract=FlashMLAContract(num_heads_q=builder.flash_num_heads, mask_mode=3, return_softmax_lse=True),
+            )
         if tokens:
             try:
                 flash.schedule = torch.empty_like(_flash_mla_schedule(flash, meta=True), device=builder.device)
+                if flash.current is not None:
+                    flash.current.schedule = torch.empty_like(
+                        _flash_mla_schedule(flash, meta=True, current=True), device=builder.device
+                    )
             except (NotImplementedError, RuntimeError) as exc:
                 del buffers[key]
                 raise RuntimeError(
@@ -245,7 +296,14 @@ def build_flash_mla_metadata(builder: Any, common: Any) -> FlashMLAMetadata:
         flash.used_q[:batch].copy_(flash.cu[1 : batch + 1] - flash.cu[:batch])
         flash.used_q[:batch].masked_fill_(common.seq_lens[:batch] <= 0, 0)
         flash.used_q[batch:].zero_()
-        flash.cache_lens[:batch].copy_(common.seq_lens[:batch])
+        lengths = common.seq_lens[:batch]
+        if split_current:
+            lengths = (lengths - flash.used_q[:batch]).clamp_min(0)
+        if dcp_size > 1:
+            lengths = get_dcp_local_seq_lens(lengths, dcp_size, builder.flash_interleave_size)[
+                :, builder.flash_dcp_rank
+            ]
+        flash.cache_lens[:batch].copy_(lengths)
         flash.cache_lens[batch:].zero_()
         flash.block_table[:batch].copy_(table)
         flash.block_table[batch:].zero_()
@@ -262,6 +320,22 @@ def build_flash_mla_metadata(builder: Any, common: Any) -> FlashMLAMetadata:
         positions = common.positions[: common.num_actual_tokens]
         flash.positions[: positions.shape[0]].copy_(positions)
         if tokens:
+            indices = torch.arange(tokens, dtype=torch.int32, device=builder.device)
+            request_ids = torch.searchsorted(flash.cu[1:], indices, right=True).long()
+            flash.token_has_kv.copy_(flash.token_live & (flash.cache_lens[request_ids] > 0))
+            if flash.current is not None:
+                current = flash.current
+                page_counts = (flash.used_q + block_size - 1) // block_size
+                page_starts = page_counts.cumsum(0) - page_counts
+                columns = torch.arange(current.block_table.shape[1], device=builder.device)
+                current.block_table.copy_(page_starts[:, None] + columns)
+                current.block_table.masked_fill_(columns >= page_counts[:, None], 0)
+                current.slots.copy_(page_starts[request_ids] * block_size + indices - flash.cu[request_ids])
+                current.slots.masked_fill_(~flash.token_live, -1)
+                schedule = _flash_mla_schedule(flash, current=True)
+                if schedule.shape != current.schedule.shape:
+                    raise RuntimeError("FlashMLA current metadata shape differs from its Meta-sized stable buffer.")
+                current.schedule.copy_(schedule)
             schedule = _flash_mla_schedule(flash)
             if schedule.shape != flash.schedule.shape:
                 raise RuntimeError("FlashMLA metadata shape differs from its Meta-sized stable buffer.")
@@ -274,6 +348,61 @@ def build_flash_mla_metadata(builder: Any, common: Any) -> FlashMLAMetadata:
     else:
         build_metadata()
     return flash
+
+
+def exchange_flash_mla_output(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    token_has_kv: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_device_group: Any,
+) -> torch.Tensor:
+    """NTD external output -> history shards for this rank's TP-local heads.
+
+    Reuse the existing DCP FP32 all-to-all. Mask known empty shards using
+    device lengths rather than relying on a native kernel's LSE sentinel.
+    """
+    if lse.shape != output.shape[:2] or lse.dtype != torch.float32:
+        raise RuntimeError("External FlashMLA DCP requires FP32 LSE with shape [Q heads, tokens].")
+    output = output.masked_fill(~token_has_kv[None, :, None], 0)
+    lse = lse.masked_fill(~token_has_kv[None, :], -torch.inf)
+    exchanged = _process_attn_out_lse(
+        output.transpose(0, 1),
+        lse.transpose(0, 1).unsqueeze(-1),
+        dcp_size=dcp_size,
+        dcp_device_group=dcp_device_group,
+    )
+    heads, tokens, width = output.shape
+    return exchanged.reshape(tokens, dcp_size, heads // dcp_size, width + 1).permute(1, 2, 0, 3)
+
+
+def combine_flash_mla_output(
+    history: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    current_output: torch.Tensor | None = None,
+    current_lse: torch.Tensor | None = None,
+    token_live: torch.Tensor,
+) -> torch.Tensor:
+    """LSE-weighted FP32 merge, counting the replicated current chunk once.
+
+    Input is [shards, local heads, tokens, latent+1]; result is local NTD.
+    Deliberately keep this unfused until correctness/graph evidence is available.
+    """
+    if current_output is not None:
+        if current_lse is None or current_lse.shape != current_output.shape[:2] or current_lse.dtype != torch.float32:
+            raise RuntimeError("External FlashMLA current chunk requires FP32 [Q heads, tokens] LSE.")
+        current_output = current_output.masked_fill(~token_live[None, :, None], 0)
+        current_lse = current_lse.masked_fill(~token_live[None, :], -torch.inf)
+        current = torch.cat((current_output.float(), current_lse.unsqueeze(-1)), dim=-1)
+        history = torch.cat((history, current.unsqueeze(0)), dim=0)
+    values, lse = history[..., :-1], history[..., -1:]
+    normalizer = torch.logsumexp(lse, dim=0, keepdim=True)
+    # All-padding tokens have no contributing shard; avoid -inf - -inf.
+    normalizer = torch.where(torch.isneginf(normalizer), 0, normalizer)
+    weights = torch.exp(lse - normalizer)
+    return (values * weights).sum(dim=0).to(dtype).contiguous()
 
 
 def validate_flash_mla_kv_cache(
