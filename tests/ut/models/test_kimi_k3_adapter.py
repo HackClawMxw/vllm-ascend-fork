@@ -4,6 +4,7 @@
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from safetensors.torch import save_file
 from torch import nn
@@ -144,7 +145,8 @@ def test_kimi_model_declares_fused_bfg_checkpoint_mapping():
     ]
 
 
-def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
+@pytest.mark.parametrize("replicated_mla", [False, True])
+def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch, replicated_mla):
     class IdentityAttention(nn.Module):
         def forward(self, *, hidden_states, positions):
             del positions
@@ -163,6 +165,7 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
     layer.mlp_res_proj = object()
     layer.mlp_res_norm = object()
     layer.self_attn = IdentityAttention()
+    layer.self_attn.mla_tp_replicated = replicated_mla
 
     collective_shapes = []
 
@@ -176,6 +179,12 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
 
     monkeypatch.setattr(kimi_k3, "sp_all_gather", fake_all_gather)
     monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", fake_reduce_scatter)
+
+    def fake_shard(hidden_states):
+        collective_shapes.append(("shard", hidden_states.shape))
+        return torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))[:2]
+
+    monkeypatch.setattr(kimi_k3, "sp_shard", fake_shard)
     monkeypatch.setattr(
         kimi_k3,
         "_apply_ascend_attn_res",
@@ -192,10 +201,71 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
 
     assert collective_shapes == [
         ("gather", torch.Size([2, 2])),
-        ("reduce_scatter", torch.Size([3, 2])),
+        ("shard" if replicated_mla else "reduce_scatter", torch.Size([3, 2])),
     ]
     assert output.shape == torch.Size([2, 2])
     assert returned_residual.shape == torch.Size([2, 1, 2])
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_replicated_mla_sp_preserves_values_and_padding(monkeypatch, rank):
+    from vllm.models.common.ops import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sequence_parallel, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", MagicMock(side_effect=AssertionError("MLA must not sum")))
+    layer = SimpleNamespace(use_sequence_parallel=True, self_attn=SimpleNamespace(mla_tp_replicated=True))
+    for tokens in (1, 3, 4, 7):
+        full = torch.arange(tokens * 2).reshape(tokens, 2).float()
+        actual = kimi_k3.AscendKimiDecoderLayer._finish_attention_output(layer, full)
+        padded = torch.nn.functional.pad(full, (0, 0, 0, (-tokens) % 4))
+        torch.testing.assert_close(actual, padded.chunk(4)[rank], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("q_lora", [None, 64])
+@pytest.mark.parametrize("gate", [False, True])
+def test_replicated_mla_loads_full_projection_weights(monkeypatch, q_lora, gate):
+    from vllm_ascend.ops import linear as ascend_linear
+
+    # Isolate backend registration, not the real linear classes or their loaders.
+    def wrapper(*args):
+        result = nn.Module()
+        result.mla_attn = SimpleNamespace(num_heads=args[1], impl=SimpleNamespace())
+        result.modules_arg = args[8]
+        return result
+
+    monkeypatch.setattr(kimi_k3, "AscendKimiK3MultiHeadLatentAttention", wrapper)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "ReplicatedLinear"):
+        monkeypatch.setattr(kimi_k3, name, getattr(ascend_linear, f"Ascend{name}"))
+    monkeypatch.setitem(kimi_k3.ascend_envs.env_variables, "VLLM_ASCEND_ENABLE_FLASH_MLA", lambda: True)
+    layer = kimi_k3.AscendKimiMLAAttention(
+        config=SimpleNamespace(rms_norm_eps=1e-6),
+        hidden_size=64,
+        num_heads=96,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=64,
+        v_head_dim=16,
+        q_lora_rank=q_lora,
+        kv_lora_rank=512,
+        use_output_gate=gate,
+        use_rope=False,
+        prefix="model.layers.1.self_attn",
+    )
+    expected = {"kv_b_proj": (96 * 24, 512), "o_proj": (64, 96 * 16)}
+    expected["q_b_proj" if q_lora else "q_proj"] = (96 * 72, q_lora or 64)
+    if gate:
+        expected["g_proj"] = (96 * 16, 64)
+    for name, shape in expected.items():
+        projection = getattr(layer, name)
+        assert projection.tp_size == 1 and projection.tp_rank == 0
+        assert tuple(projection.weight.shape) == shape
+        weight = torch.arange(projection.weight.numel(), dtype=projection.weight.dtype).reshape(shape) / 1024
+        projection.weight.weight_loader(projection.weight, weight)
+        torch.testing.assert_close(projection.weight, weight, atol=0, rtol=0)
+    assert not layer.o_proj.reduce_results
+    assert layer.mla_attn.mla_attn.num_heads == layer.num_local_heads == 96
+    assert layer.mla_attn.modules_arg.o_proj is layer.o_proj
+    assert layer.mla_attn.modules_arg.kv_b_proj is layer.kv_b_proj
 
 
 def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
