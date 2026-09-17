@@ -19,7 +19,6 @@ from vllm_ascend.attention.mla_v1 import (
 )
 # isort: on
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.context_parallel.common_cp import (
     DCPImplMixin,
@@ -32,7 +31,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     update_graph_params_workspaces,
 )
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, weak_ref_tensors
+from vllm_ascend.utils import weak_ref_tensors
 
 
 @dataclass
@@ -172,42 +171,6 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
     understand this class
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
-            # MRV2 checks this capability after loading the model. The
-            # external path returns LSE for its internal DCP merge.
-            self.can_return_lse_for_decode = True
-            self.need_to_return_lse_for_decode = self.dcp_size > 1
-
-    @property
-    def dcp_q_replicate(self) -> bool:
-        return envs.VLLM_ASCEND_ENABLE_FLASH_MLA and getattr(self.q_proj, "qrep_active", False)
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        if self.dcp_q_replicate:
-            self.enable_mlapo = False
-            if self.fa_quant_layer:
-                raise ValueError("DCP replicated Q requires unquantized MLA KV cache")
-        super().process_weights_after_loading(act_dtype)
-        if self.dcp_q_replicate:
-            # Replicate only K-up absorption weights. Keep the existing V-up
-            # shard, and preserve addresses when reloading captured weights.
-            weight = torch_npu.npu_format_cast(self.W_UK_T, ACL_FORMAT_FRACTAL_ND)
-            gathered = self._dcp_all_gather(weight, 0)
-            if hasattr(self, "dcp_W_UK_T"):
-                self.dcp_W_UK_T.copy_(gathered)
-            else:
-                self.dcp_W_UK_T = gathered
-
-    def _q_proj_and_k_up_proj(self, x):
-        if not self.dcp_q_replicate:
-            return super()._q_proj_and_k_up_proj(x)
-        q = self.q_proj(x)[0].view(-1, self.num_heads * self.dcp_size, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_abs = torch.bmm(q_nope.transpose(0, 1), self.dcp_W_UK_T).transpose(0, 1)
-        return q_abs, q_pe
-
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -217,10 +180,6 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         speculative_config=None,
         draft_attn_metadatas=None,
     ):
-        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
-            # MRV2 DeviceMetadataExecutor updates both Flash schedules and
-            # waits before replay. There are no FIA graph tasks to update.
-            return
         if _EXTRA_CTX.is_draft_model:
             if _EXTRA_CTX.is_draft_model_prefill:
                 graph_params = get_draft_graph_prefill_params()

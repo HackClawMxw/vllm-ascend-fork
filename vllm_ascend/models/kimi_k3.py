@@ -13,7 +13,7 @@ from copy import copy
 import torch
 import vllm.envs as envs
 from torch import nn
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -23,10 +23,13 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    DCPGroupColumnParallelLinear,
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mla import MLAModules
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -81,6 +84,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
+from vllm_ascend.ops.kimi_mla import AscendKimiK3MultiHeadLatentAttention
 from vllm_ascend.utils import get_rotation_path
 
 if HAS_TRITON:
@@ -243,7 +247,7 @@ class AscendKimiMoE(nn.Module):
 
 
 class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
-    """Extend vLLM's generic Kimi MLA only for DSpark RoPE metadata."""
+    """Kimi MLA with opt-in full-head FlashMLA and DSpark RoPE metadata."""
 
     def __init__(
         self,
@@ -265,7 +269,8 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     ) -> None:
         upstream_config = copy(config)
         upstream_config.mla_use_output_gate = use_output_gate
-        super().__init__(
+        init = self._init_replicated_mla if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else super().__init__
+        init(
             config=upstream_config,
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -279,30 +284,8 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
             quant_config=quant_config,
             prefix=prefix,
         )
+        self.mla_tp_replicated = ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA
         attention_layer = self._attention_layer
-        if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
-            parallel_config = get_current_vllm_config().parallel_config
-            qrep_requested = (
-                envs.VLLM_DCP_Q_REPLICATE if envs.is_set("VLLM_DCP_Q_REPLICATE") else parallel_config.dcp_q_replicate
-            )
-            if (
-                qrep_requested
-                and parallel_config.decode_context_parallel_size > 1
-                and parallel_config.prefill_context_parallel_size == 1
-            ):
-                # PR #5's group-sharded projection, installed before checkpoint
-                # loading. V-up, gate and O projection remain TP-local.
-                name = "q_b_proj" if q_lora_rank is not None else "q_proj"
-                projection = DCPGroupColumnParallelLinear(
-                    q_lora_rank if q_lora_rank is not None else hidden_size,
-                    num_heads * (qk_nope_head_dim + qk_rope_head_dim),
-                    bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.{name}",
-                )
-                setattr(self, name, projection)
-                attention_layer.impl.q_proj = projection
-                attention_layer.impl.enable_mlapo = False
         if disable_mlapo:
             attention_layer.impl.enable_mlapo = False
         if not use_rope and not non_causal_multi_token_decode:
@@ -337,6 +320,115 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         attention_layer.impl.scale = float(self.scaling)
         attention_layer.impl.rotary_emb = rotary_emb
         attention_layer.impl.use_mla_rope = use_rope
+
+    def _init_replicated_mla(
+        self,
+        config,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: int | None,
+        kv_lora_rank: int,
+        use_nope: bool,
+        cache_config: CacheConfig | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        """Construct full weights before loading, without changing global TP.
+
+        Mirror the pinned upstream Kimi module names/loaders, but register the
+        attention wrapper only once, already with the complete head geometry.
+        """
+        nn.Module.__init__(self)
+        if num_heads not in (64, 96):
+            raise ValueError("Replicated Kimi FlashMLA requires 64 or 96 actual Q heads.")
+        self.hidden_size = hidden_size
+        self.num_heads = self.num_local_heads = num_heads
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.scaling = self.qk_head_dim**-0.5
+        self.use_nope = use_nope
+        self.use_output_gate = config.mla_use_output_gate
+
+        def column(input_size, output_size, name):
+            return ColumnParallelLinear(
+                input_size,
+                output_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.{name}",
+                disable_tp=True,
+            )
+
+        if q_lora_rank is not None:
+            self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [q_lora_rank, kv_lora_rank + qk_rope_head_dim],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+                disable_tp=True,
+            )
+            self.q_a_layernorm = RMSNorm(q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = column(q_lora_rank, num_heads * self.qk_head_dim, "q_b_proj")
+        else:
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                hidden_size,
+                kv_lora_rank + qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_with_mqa",
+                disable_tp=True,
+            )
+            self.q_proj = column(hidden_size, num_heads * self.qk_head_dim, "q_proj")
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = column(kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), "kv_b_proj")
+        self.o_proj = RowParallelLinear(
+            num_heads * v_head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+            disable_tp=True,
+            reduce_results=False,
+        )
+        if self.use_output_gate:
+            self.g_proj = column(hidden_size, num_heads * v_head_dim, "g_proj")
+        modules = MLAModules(
+            kv_a_layernorm=self.kv_a_layernorm,
+            kv_b_proj=self.kv_b_proj,
+            rotary_emb=None,
+            o_proj=self.o_proj,
+            fused_qkv_a_proj=getattr(self, "fused_qkv_a_proj", None),
+            kv_a_proj_with_mqa=getattr(self, "kv_a_proj_with_mqa", None),
+            q_a_layernorm=getattr(self, "q_a_layernorm", None),
+            q_b_proj=getattr(self, "q_b_proj", None),
+            q_proj=getattr(self, "q_proj", None),
+            indexer=None,
+            is_sparse=False,
+            topk_indices_buffer=None,
+            g_proj=getattr(self, "g_proj", None),
+        )
+        self.mla_attn = AscendKimiK3MultiHeadLatentAttention(
+            hidden_size,
+            num_heads,
+            self.scaling,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            q_lora_rank,
+            kv_lora_rank,
+            modules,
+            cache_config,
+            quant_config,
+            prefix,
+        )
 
     @property
     def _attention_layer(self):
@@ -500,6 +592,15 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         # Ascend attention returns its output instead of filling an AMD buffer.
         return self.self_attn(positions=positions, hidden_states=hidden_states)
 
+    def _finish_attention_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.use_sequence_parallel:
+            return hidden_states
+        # Replicated MLA has already computed the full O projection. Summing
+        # identical outputs would multiply them by TP; KDA still needs the sum.
+        if getattr(self.self_attn, "mla_tp_replicated", False):
+            return sp_shard(hidden_states)
+        return sp_reduce_scatter(hidden_states)
+
     def forward_attn_residual(
         self,
         positions: torch.Tensor,
@@ -528,8 +629,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
             hidden_states=hidden_states,
             positions=positions,
         )
-        if self.use_sequence_parallel:
-            hidden_states = sp_reduce_scatter(hidden_states)
+        hidden_states = self._finish_attention_output(hidden_states)
 
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         mlp_valid_blocks = self.prev_valid_blocks + (1 if self.is_block_write_layer else 0)

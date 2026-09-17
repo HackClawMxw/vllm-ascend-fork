@@ -91,11 +91,113 @@ class HostFlashMLAContractTests(unittest.TestCase):
         self.assertIn("flash.token_live.copy_(flash.live_boundaries.cumsum(0)[:tokens] > 0)", build)
         self.assertIn("flash.slots.masked_fill_(~flash.token_live, -1)", build)
         forward = function(source("vllm_ascend/attention/mla_v1.py"), "_forward_flash")
-        main = next(
+        calls = [
             n for n in ast.walk(forward) if isinstance(n, ast.Call) and ast.unparse(n.func) == "flash_mla_with_kvcache"
-        )
+        ]
+        self.assertEqual(len(calls), 1)
+        main = calls[0]
         self.assertEqual([ast.unparse(n) for n in main.args], ["flash.query", "kv_cache"])
         self.assertNotIn("kv_cache.contiguous()", ast.unparse(forward))
+        for removed in ("_local_view", "exchange_flash_mla_output", "combine_flash_mla_output", "flash.current"):
+            self.assertNotIn(removed, ast.unparse(forward))
+
+    def test_replicated_constructor_selects_parent_controls_before_wrapper(self):
+        calls, wrappers, upstream = [], [], []
+
+        def linear(input_size, output_size, **kwargs):
+            result = SimpleNamespace(input_size=input_size, output_size=output_size, **kwargs)
+            calls.append(result)
+            return result
+
+        def wrapper(*args):
+            wrappers.append(args)
+            return SimpleNamespace(mla_attn=SimpleNamespace(impl=SimpleNamespace()))
+
+        class Base:
+            def __init__(self, **kwargs):
+                upstream.append(kwargs)
+                self.mla_attn = SimpleNamespace(mla_attn=SimpleNamespace(impl=SimpleNamespace()))
+
+        flags = SimpleNamespace(VLLM_ASCEND_ENABLE_FLASH_MLA=True)
+        loaded = extract(
+            source("vllm_ascend/models/kimi_k3.py"),
+            {"AscendKimiMLAAttention"},
+            {
+                "UpstreamKimiMLAAttention": Base,
+                "copy": copy.copy,
+                "ascend_envs": flags,
+                "nn": SimpleNamespace(Module=object),
+                "ColumnParallelLinear": linear,
+                "MergedColumnParallelLinear": linear,
+                "ReplicatedLinear": linear,
+                "RowParallelLinear": linear,
+                "RMSNorm": lambda *a, **kw: object(),
+                "MLAModules": SimpleNamespace,
+                "AscendKimiK3MultiHeadLatentAttention": wrapper,
+            },
+        )
+        for q_lora in (None, 64):
+            for gate in (False, True):
+                calls.clear()
+                wrappers.clear()
+                config = SimpleNamespace(rms_norm_eps=1e-6)
+                kwargs = dict(
+                    config=config,
+                    hidden_size=64,
+                    num_heads=96,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    q_lora_rank=q_lora,
+                    kv_lora_rank=512,
+                    use_output_gate=gate,
+                    use_rope=False,
+                    prefix="model.layers.1.self_attn",
+                )
+                model = loaded.AscendKimiMLAAttention(**kwargs)
+                self.assertEqual(len(wrappers), 1)
+                self.assertEqual((model.num_local_heads, wrappers[0][1]), (96, 96))
+                self.assertTrue(model.mla_tp_replicated)
+                self.assertTrue(all(item.disable_tp for item in calls))
+                self.assertFalse(model.o_proj.reduce_results)
+                self.assertEqual(model.o_proj.input_size, 96 * 128)
+                self.assertEqual(model.kv_b_proj.output_size, 96 * (128 + 128))
+                modules = wrappers[0][8]
+                for name in ("kv_b_proj", "o_proj", "g_proj"):
+                    self.assertIs(getattr(modules, name), getattr(model, name, None))
+                self.assertEqual(model.use_output_gate, gate)
+                self.assertFalse(hasattr(config, "mla_use_output_gate"))
+                self.assertEqual(upstream, [])
+        flags.VLLM_ASCEND_ENABLE_FLASH_MLA = False
+        disabled = loaded.AscendKimiMLAAttention(**kwargs)
+        self.assertEqual(len(upstream), 1)
+        self.assertFalse(disabled.mla_tp_replicated)
+
+    def test_sp_replicated_output_is_sharded_not_summed(self):
+        calls = []
+        tree = source("vllm_ascend/models/kimi_k3.py")
+        method = function(tree, "_finish_attention_output")
+        loaded = extract(
+            ast.Module(body=[method], type_ignores=[]),
+            {method.name},
+            {
+                "sp_shard": lambda x: calls.append("shard") or x,
+                "sp_reduce_scatter": lambda x: calls.append("sum") or x,
+            },
+        )
+        value = object()
+        for sp, replicated, expected in (
+            (False, True, []),
+            (False, False, []),
+            (True, True, ["shard"]),
+            (True, False, ["sum"]),
+        ):
+            calls.clear()
+            layer = SimpleNamespace(use_sequence_parallel=sp, self_attn=SimpleNamespace(mla_tp_replicated=replicated))
+            self.assertIs(loaded._finish_attention_output(layer, value), value)
+            self.assertEqual(calls, expected)
+        residual = ast.unparse(function(tree, "forward_attn_residual"))
+        self.assertIn("hidden_states = self._finish_attention_output(hidden_states)", residual)
 
     def test_graph_is_not_configuration_blocked(self):
         guard = ast.unparse(function(source("vllm_ascend/platform.py"), "_validate_flash_mla_config"))
@@ -103,189 +205,6 @@ class HostFlashMLAContractTests(unittest.TestCase):
         update = function(source("vllm_ascend/attention/mla_v1.py"), "update_graph_params")
         self.assertEqual(ast.unparse(update.body[0].test), "envs.VLLM_ASCEND_ENABLE_FLASH_MLA")
         self.assertIsInstance(update.body[0].body[0], ast.Return)
-
-    def test_hybrid_mla_config_and_disabled_switch(self):
-        envs = SimpleNamespace(VLLM_ASCEND_ENABLE_FLASH_MLA=True)
-        loaded = extract(
-            source("vllm_ascend/platform.py"),
-            {"_validate_flash_mla_config"},
-            {
-                "envs": envs,
-                "torch": SimpleNamespace(bfloat16="bf16"),
-                "model_uses_sfa_sparse": lambda _: False,
-                "KVPPConfig": SimpleNamespace(from_vllm_config=lambda _: SimpleNamespace(size=1)),
-            },
-        )
-        config = SimpleNamespace(
-            use_v2_model_runner=True,
-            model_config=SimpleNamespace(use_mla=True, is_hybrid=True, dtype="bf16"),
-            parallel_config=SimpleNamespace(
-                prefill_context_parallel_size=1, decode_context_parallel_size=1, tensor_parallel_size=4
-            ),
-            cache_config=SimpleNamespace(cache_dtype="auto"),
-            speculative_config=None,
-            kv_transfer_config=None,
-        )
-        # Stub only the device import; execute the real configuration guard.
-        with patch.dict(sys.modules, {"vllm_ascend.device.device_config": SimpleNamespace(is_950=lambda: True)}):
-            loaded._validate_flash_mla_config(config)
-            config.model_config.use_mla = False
-            with self.assertRaisesRegex(ValueError, "model must use MLA"):
-                loaded._validate_flash_mla_config(config)
-            config.model_config.use_mla = True
-            config.parallel_config.decode_context_parallel_size = 2
-            with self.assertRaisesRegex(ValueError, "DCP size equal to TP"):
-                loaded._validate_flash_mla_config(config)
-            config.parallel_config.decode_context_parallel_size = 4
-            loaded._validate_flash_mla_config(config)
-        envs.VLLM_ASCEND_ENABLE_FLASH_MLA = False
-        loaded._validate_flash_mla_config(None)
-
-    def test_dcp_contract_counts_real_group_heads(self):
-        loaded = extract(
-            source("vllm_ascend/attention/flash_mla.py"),
-            {"FlashMLAContract", "init_flash_mla_metadata"},
-            {
-                "__name__": __name__,
-                "dataclass": dataclass,
-                "replace": replace,
-                "Any": Any,
-                "ensure_flash_mla_ops_loaded": lambda: None,
-                "torch": SimpleNamespace(int8="int8", ones=lambda *a, **kw: None, triu=lambda *a, **kw: None),
-            },
-        )
-        builder = SimpleNamespace(
-            device="npu", vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
-        )
-        for local_heads, dcp_size, expected in ((24, 4, 96), (12, 8, 96), (16, 4, 64), (64, 1, 64)):
-            impl = SimpleNamespace(num_heads=local_heads, dcp_size=dcp_size, dcp_rank=0, dcp_q_replicate=True)
-            loaded.init_flash_mla_metadata(builder, impl)
-            self.assertEqual(builder.flash_num_heads, expected)
-        impl.dcp_size, impl.dcp_q_replicate = 4, False
-        with self.assertRaisesRegex(ValueError, "replicated Q"):
-            loaded.init_flash_mla_metadata(builder, impl)
-        impl.num_heads, impl.dcp_size, impl.dcp_q_replicate = 24, 1, False
-        with self.assertRaisesRegex(ValueError, "64 or 96"):
-            loaded.init_flash_mla_metadata(builder, impl)
-
-    def test_dcp_both_calls_keep_full_query_and_slice_only_output(self):
-        forward = function(source("vllm_ascend/attention/mla_v1.py"), "_forward_flash")
-        calls = [
-            n for n in ast.walk(forward) if isinstance(n, ast.Call) and ast.unparse(n.func) == "flash_mla_with_kvcache"
-        ]
-        self.assertEqual(len(calls), 2)
-        self.assertTrue(all(ast.unparse(n.args[0]) == "flash.query" for n in calls))
-        code = ast.unparse(forward)
-        self.assertNotIn("_local_view", code)
-        self.assertIn("current_output[start:start + self.num_heads]", code)
-        self.assertIn("cache_seqlens=flash.used_q", code)
-        update = function(source("vllm_ascend/attention/context_parallel/mla_cp.py"), "update_graph_params")
-        self.assertEqual(ast.unparse(update.body[0].test), "envs.VLLM_ASCEND_ENABLE_FLASH_MLA")
-        self.assertIsInstance(update.body[0].body[0], ast.Return)
-
-    def test_dcp_declares_lse_to_runner_only_when_enabled(self):
-        class Base:
-            can_return_lse_for_decode = False
-            need_to_return_lse_for_decode = False
-
-            def __init__(self):
-                self.dcp_size = 4
-
-        envs = SimpleNamespace(VLLM_ASCEND_ENABLE_FLASH_MLA=True)
-        loaded = extract(
-            source("vllm_ascend/attention/context_parallel/mla_cp.py"),
-            {"AscendMlaDCPImpl"},
-            {"DCPImplMixin": Base, "AscendMLAImpl": type("Impl", (), {}), "envs": envs},
-        )
-        enabled = loaded.AscendMlaDCPImpl()
-        self.assertTrue(enabled.can_return_lse_for_decode)
-        self.assertTrue(enabled.need_to_return_lse_for_decode)
-        envs.VLLM_ASCEND_ENABLE_FLASH_MLA = False
-        disabled = loaded.AscendMlaDCPImpl()
-        self.assertFalse(disabled.can_return_lse_for_decode)
-        self.assertFalse(disabled.need_to_return_lse_for_decode)
-
-    def test_k3_qrep_is_opt_in_and_precedes_nope_return(self):
-        cls = next(
-            n
-            for n in source("vllm_ascend/models/kimi_k3.py").body
-            if getattr(n, "name", None) == "AscendKimiMLAAttention"
-        )
-        init = function(cls, "__init__")
-        code = ast.unparse(init)
-        self.assertLess(code.index("DCPGroupColumnParallelLinear("), code.index("if not use_rope"))
-        branch = next(
-            n
-            for n in init.body
-            if isinstance(n, ast.If) and ast.unparse(n.test) == "ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA"
-        )
-        text = ast.unparse(branch)
-        self.assertIn("setattr(self, name, projection)", text)
-        self.assertIn("attention_layer.impl.q_proj = projection", text)
-        self.assertNotIn("o_proj =", text)
-
-    def test_k3_layer_dispatch_keeps_kda_separate_from_nope_mla(self):
-        cls = next(
-            n
-            for n in source("vllm_ascend/models/kimi_k3.py").body
-            if getattr(n, "name", None) == "AscendKimiDecoderLayer"
-        )
-        branch = next(
-            n
-            for n in ast.walk(cls)
-            if isinstance(n, ast.If) and ast.unparse(n.test) == "config.is_kda_layer(layer_idx)"
-        )
-        kda = [n for statement in branch.body for n in ast.walk(statement) if isinstance(n, ast.Call)]
-        self.assertEqual([ast.unparse(n.func) for n in kda], ["AscendKimiK3DeltaAttention"])
-        mla = next(
-            n
-            for statement in branch.orelse
-            for n in ast.walk(statement)
-            if isinstance(n, ast.Call) and ast.unparse(n.func) == "AscendKimiMLAAttention"
-        )
-        self.assertIs(next(kw.value.value for kw in mla.keywords if kw.arg == "use_rope"), False)
-
-    def test_flash_rope_is_optional_and_keeps_the_64_channels(self):
-        forward = function(source("vllm_ascend/attention/mla_v1.py"), "_forward_flash")
-        # Execute the actual rotation/concatenation slice, without importing torch.
-        start = next(
-            i for i, n in enumerate(forward.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "c_kv"
-        )
-        end = next(
-            i for i, n in enumerate(forward.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "query"
-        )
-        code = compile(ast.Module(body=forward.body[start + 1 : end + 1], type_ignores=[]), "<rope slice>", "exec")
-        q_abs, q_pe, k_pe, positions = object(), object(), object(), object()
-        rotated_q, rotated_k = object(), object()
-        calls = []
-
-        def get_cos_sin(actual_positions, use_cache):
-            self.assertIs(actual_positions, positions)
-            self.assertFalse(use_cache)
-            calls.append("positions")
-            return "cos", "sin"
-
-        def rotate(tensor, cos, sin):
-            self.assertEqual((cos, sin), ("cos", "sin"))
-            calls.append(tensor)
-            return rotated_q if tensor is q_pe else rotated_k
-
-        for use_rope in (False, True):
-            with self.subTest(use_rope=use_rope):
-                calls.clear()
-                scope = {
-                    "self": SimpleNamespace(use_mla_rope=use_rope, rope_single=rotate),
-                    "flash": SimpleNamespace(positions=positions),
-                    "get_cos_and_sin_mla": get_cos_sin,
-                    "torch": SimpleNamespace(cat=lambda values, dim: (values, dim)),
-                    "q_nope": q_abs,
-                    "q_pe": q_pe,
-                    "k_pe": k_pe,
-                }
-                exec(code, scope)
-                self.assertEqual(scope["query"], ((q_abs, rotated_q if use_rope else q_pe), -1))
-                self.assertIs(scope["k_pe"], rotated_k if use_rope else k_pe)
-                self.assertEqual(calls, ["positions", q_pe, k_pe] if use_rope else [])
 
     def test_execute_and_capture_own_metadata_context(self):
         for path, name in (
@@ -368,6 +287,107 @@ class HostFlashMLAContractTests(unittest.TestCase):
                 },
             )
             self.assertEqual(bool(allowed), field == "eligible")
+
+    def test_hybrid_mla_config_and_disabled_switch(self):
+        envs = SimpleNamespace(VLLM_ASCEND_ENABLE_FLASH_MLA=True)
+        loaded = extract(
+            source("vllm_ascend/platform.py"),
+            {"_validate_flash_mla_config"},
+            {
+                "envs": envs,
+                "torch": SimpleNamespace(bfloat16="bf16"),
+                "model_uses_sfa_sparse": lambda _: False,
+                "KVPPConfig": SimpleNamespace(from_vllm_config=lambda _: SimpleNamespace(size=1)),
+            },
+        )
+        config = SimpleNamespace(
+            use_v2_model_runner=True,
+            model_config=SimpleNamespace(use_mla=True, is_hybrid=True, dtype="bf16"),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1, decode_context_parallel_size=1, tensor_parallel_size=4
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            speculative_config=None,
+            kv_transfer_config=None,
+        )
+        # Stub only the device import; execute the real configuration guard.
+        with patch.dict(sys.modules, {"vllm_ascend.device.device_config": SimpleNamespace(is_950=lambda: True)}):
+            loaded._validate_flash_mla_config(config)
+            config.model_config.use_mla = False
+            with self.assertRaisesRegex(ValueError, "model must use MLA"):
+                loaded._validate_flash_mla_config(config)
+            config.model_config.use_mla = True
+            config.parallel_config.decode_context_parallel_size = 2
+            with self.assertRaisesRegex(ValueError, "DCP size must be 1"):
+                loaded._validate_flash_mla_config(config)
+            config.parallel_config.decode_context_parallel_size = 4
+            with self.assertRaisesRegex(ValueError, "DCP size must be 1"):
+                loaded._validate_flash_mla_config(config)
+        envs.VLLM_ASCEND_ENABLE_FLASH_MLA = False
+        loaded._validate_flash_mla_config(None)
+
+    def test_k3_layer_dispatch_keeps_kda_separate_from_nope_mla(self):
+        cls = next(
+            n
+            for n in source("vllm_ascend/models/kimi_k3.py").body
+            if getattr(n, "name", None) == "AscendKimiDecoderLayer"
+        )
+        branch = next(
+            n
+            for n in ast.walk(cls)
+            if isinstance(n, ast.If) and ast.unparse(n.test) == "config.is_kda_layer(layer_idx)"
+        )
+        kda = [n for statement in branch.body for n in ast.walk(statement) if isinstance(n, ast.Call)]
+        self.assertEqual([ast.unparse(n.func) for n in kda], ["AscendKimiK3DeltaAttention"])
+        mla = next(
+            n
+            for statement in branch.orelse
+            for n in ast.walk(statement)
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "AscendKimiMLAAttention"
+        )
+        self.assertIs(next(kw.value.value for kw in mla.keywords if kw.arg == "use_rope"), False)
+
+    def test_flash_rope_is_optional_and_keeps_the_64_channels(self):
+        forward = function(source("vllm_ascend/attention/mla_v1.py"), "_forward_flash")
+        # Execute the actual rotation/concatenation slice, without importing torch.
+        start = next(
+            i for i, n in enumerate(forward.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "c_kv"
+        )
+        end = next(
+            i for i, n in enumerate(forward.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "query"
+        )
+        code = compile(ast.Module(body=forward.body[start + 1 : end + 1], type_ignores=[]), "<rope slice>", "exec")
+        q_abs, q_pe, k_pe, positions = object(), object(), object(), object()
+        rotated_q, rotated_k = object(), object()
+        calls = []
+
+        def get_cos_sin(actual_positions, use_cache):
+            self.assertIs(actual_positions, positions)
+            self.assertFalse(use_cache)
+            calls.append("positions")
+            return "cos", "sin"
+
+        def rotate(tensor, cos, sin):
+            self.assertEqual((cos, sin), ("cos", "sin"))
+            calls.append(tensor)
+            return rotated_q if tensor is q_pe else rotated_k
+
+        for use_rope in (False, True):
+            with self.subTest(use_rope=use_rope):
+                calls.clear()
+                scope = {
+                    "self": SimpleNamespace(use_mla_rope=use_rope, rope_single=rotate),
+                    "flash": SimpleNamespace(positions=positions),
+                    "get_cos_and_sin_mla": get_cos_sin,
+                    "torch": SimpleNamespace(cat=lambda values, dim: (values, dim)),
+                    "q_nope": q_abs,
+                    "q_pe": q_pe,
+                    "k_pe": k_pe,
+                }
+                exec(code, scope)
+                self.assertEqual(scope["query"], ((q_abs, rotated_q if use_rope else q_pe), -1))
+                self.assertIs(scope["k_pe"], rotated_k if use_rope else k_pe)
+                self.assertEqual(calls, ["positions", q_pe, k_pe] if use_rope else [])
 
 
 if __name__ == "__main__":

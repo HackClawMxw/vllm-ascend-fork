@@ -370,6 +370,8 @@ def _make_layer(*, gate, bias, fused, heads=HEADS_Q):
 
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("fused", [True, False], ids=["fused-qkv", "separate-q-kv"])
+@pytest.mark.parametrize("heads", [64, 96])
+@pytest.mark.parametrize("use_rope", [True, False], ids=["rope", "nope"])
 @pytest.mark.parametrize(
     ("query_lens", "gate", "bias", "input_pad", "output_pad", "expect_fast"),
     [
@@ -385,13 +387,14 @@ def _make_layer(*, gate, bias, fused, heads=HEADS_Q):
 )
 @torch.inference_mode()
 def test_external_flash_mla_layer_forward(
-    monkeypatch, block_size, fused, query_lens, gate, bias, input_pad, output_pad, expect_fast
+    monkeypatch, block_size, fused, heads, use_rope, query_lens, gate, bias, input_pad, output_pad, expect_fast
 ):
     """Real schedule/scatter/attention/V-up/gate/output; synthetic layer, not a model smoke."""
     if not is_950():
         pytest.skip("external FlashMLA is scoped to A5")
     torch.manual_seed(20260918)
-    impl = _make_layer(gate=gate, bias=bias, fused=fused)
+    impl = _make_layer(gate=gate, bias=bias, fused=fused, heads=heads)
+    impl.use_mla_rope = use_rope
     cache, backing, protected = _make_strided_cache(block_size)
     protected_before = backing.cpu()[protected].clone()
     cache_identity = cache.data_ptr(), cache.stride(), cache.storage_offset()
@@ -424,7 +427,7 @@ def test_external_flash_mla_layer_forward(
     mask = torch.triu(torch.ones(2048, 2048, dtype=torch.int8, device="npu"), diagonal=1)
     monkeypatch.setitem(envs.env_variables, "VLLM_ASCEND_ENABLE_FLASH_MLA", lambda: True)
     builder = mla_v1.AscendMLAMetadataBuilder.__new__(mla_v1.AscendMLAMetadataBuilder)
-    builder.flash_num_heads = HEADS_Q
+    builder.flash_num_heads = heads
     builder.kernel_block_size = block_size
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size * 6, dtype=torch.bfloat16)
     builder.device = cache.device
