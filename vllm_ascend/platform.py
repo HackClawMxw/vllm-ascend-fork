@@ -28,6 +28,8 @@ import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
+from vllm_ascend import envs
+
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
@@ -238,6 +240,11 @@ class NPUPlatform(Platform):
             pass
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
+
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+            if not use_mla or use_sparse or use_compress or attn_selector_config.use_pcp:
+                raise ValueError("A5 FlashMLA requires dense, uncompressed MLA with PCP disabled.")
+            return "vllm_ascend.attention.mla_v1.AscendMLABackend"
 
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
@@ -468,6 +475,7 @@ class NPUPlatform(Platform):
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
 
+        _validate_flash_mla_config(vllm_config)
         cls._validate_indexer_pp_config(vllm_config)
 
         _validate_draft_decode_context_parallel_config(vllm_config)
@@ -630,6 +638,51 @@ class NPUPlatform(Platform):
             "sinks": sinks,
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
+
+
+def _validate_flash_mla_config(vllm_config: VllmConfig) -> None:
+    """Reject configurations outside the opt-in external A5 MLA contract."""
+
+    if not envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+        return
+
+    from vllm_ascend.device.device_config import is_950
+
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    cache_config = vllm_config.cache_config
+    errors: list[str] = []
+    if not is_950():
+        errors.append("the installed Ascend target must be A5")
+    if not vllm_config.use_v2_model_runner:
+        errors.append("MRV2 must be enabled")
+    # Hybrid K3 models dispatch KDA layers separately; this contract applies
+    # only to their MLA layers, not to the recurrent state backend.
+    if not model_config.use_mla:
+        errors.append("the model must use MLA")
+    if model_uses_sfa_sparse(model_config):
+        errors.append("sparse/SFA attention is unsupported")
+    if model_config.dtype != torch.bfloat16:
+        errors.append(f"model dtype must be BF16, got {model_config.dtype}")
+    if cache_config.cache_dtype not in ("auto", "bfloat16", torch.bfloat16):
+        errors.append(f"KV cache dtype must resolve to unquantized BF16, got {cache_config.cache_dtype}")
+    if parallel_config.prefill_context_parallel_size != 1:
+        errors.append("PCP size must be 1")
+    if parallel_config.decode_context_parallel_size > 1 and (
+        parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size
+    ):
+        errors.append("external FlashMLA currently requires DCP size equal to TP size, or DCP=1")
+    if KVPPConfig.from_vllm_config(vllm_config).size != 1:
+        errors.append("KV layer parallelism is unsupported")
+    if vllm_config.speculative_config is not None:
+        errors.append("speculative decoding is unsupported")
+    if vllm_config.kv_transfer_config is not None:
+        errors.append("PD/KV-transfer execution is unsupported")
+
+    if errors:
+        raise ValueError(
+            "VLLM_ASCEND_ENABLE_FLASH_MLA=1 violates the A5 MRV2 FlashMLA contract: " + "; ".join(errors) + "."
+        )
 
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:

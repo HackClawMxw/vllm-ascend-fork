@@ -19,6 +19,7 @@
 
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -68,10 +70,31 @@ from vllm_ascend.utils import (
     is_hidden_state_cache_spec,
     vllm_version_is,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor, DeviceMetadataTaskProvider
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+
+
+_device_metadata_executor: ContextVar[DeviceMetadataExecutor | None] = ContextVar(
+    "ascend_mrv2_device_metadata_executor", default=None
+)
+
+
+@contextmanager
+def device_metadata_context(executor: DeviceMetadataExecutor | None):
+    """Keep task buffers owned until the target/draft consumer has been queued."""
+    if executor is None or _device_metadata_executor.get() is executor:
+        yield
+        return
+    token = _device_metadata_executor.set(executor)
+    try:
+        yield
+    finally:
+        if executor.submission_in_flight:
+            executor.release()
+        _device_metadata_executor.reset(token)
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -218,6 +241,12 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
+    executor = _device_metadata_executor.get()
+    if executor is not None and executor.submission_in_flight:
+        # Capture factories can build another set after consuming the
+        # previous one on this stream. Match reference #1's ownership fence.
+        executor.release()
+    device_metadata_tasks = []
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
@@ -240,6 +269,8 @@ def build_attn_metadata(
         num_actual_reqs = num_reqs
 
     # positions will not be used directly in graph modes, so it is saft to create it here.
+    if positions is None and ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA:
+        raise ValueError("A5 FlashMLA requires real MRV2 positions; synthesized zero positions are invalid for RoPE.")
     if positions is None:
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
@@ -286,6 +317,8 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            if executor is not None and isinstance(attn_metadata_builder, DeviceMetadataTaskProvider):
+                attn_metadata_builder.enable_device_metadata()
             is_dsa_builder = isinstance(attn_metadata_builder, AscendDSAMetadataBuilder)
             is_sfa_builder = isinstance(attn_metadata_builder, AscendSFAMetadataBuilder)
             attn_metadata_extra_kwargs = (
@@ -326,6 +359,16 @@ def build_attn_metadata(
                 common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if executor is not None and isinstance(attn_metadata_builder, DeviceMetadataTaskProvider):
+                device_metadata_tasks.extend(attn_metadata_builder.take_device_metadata_tasks())
+    if device_metadata_tasks:
+        # Both capture factories and runtime builders execute outside the
+        # model graph; replay reads stable buffers after these stream waits.
+        assert not torch.npu.is_current_stream_capturing()
+        assert executor is not None
+        executor.submit(device_metadata_tasks)
+        for task in device_metadata_tasks:
+            executor.wait(task.stage, task.group_id)
     return attn_metadata
 
 
