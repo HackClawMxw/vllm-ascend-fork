@@ -217,3 +217,19 @@ def test_graph_padding_does_not_add_requests_or_require_stage_flags(api):
     common.num_actual_tokens = 8
     with pytest.raises(RuntimeError, match="active request batch"):
         api.split_flashmla_requests(common)
+
+
+def test_diagnostic_switch_is_explicit_and_off_by_default(monkeypatch):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/envs.py"
+    env = runpy.run_path(str(path))
+    name = "VLLM_ASCEND_FLASH_MLA_TRACE"
+    read = env["env_variables"][name]
+    monkeypatch.delenv(name, raising=False)
+    assert read() is False
+    for value, expected in (("0", False), ("1", True)):
+        monkeypatch.setenv(name, value)
+        assert read() is expected
+    for invalid in ("true", "-1", "2", ""):
+        monkeypatch.setenv(name, invalid)
+        with pytest.raises(ValueError):
+            read()

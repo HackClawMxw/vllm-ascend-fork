@@ -1992,6 +1992,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         flash.query[..., : self.kv_lora_rank].copy_(preprocessed.ql_nope)
         flash.query[..., self.kv_lora_rank :].copy_(preprocessed.q_pe)
         record_attention_compute_start()
+        if envs.VLLM_ASCEND_FLASH_MLA_TRACE:
+            logger.info(
+                "[FlashMLA TRACE] event=decode_call layer=%s schedule_ptr=%s "
+                "query_ptr=%s cache_ptr=%s stride=%s offset=%s",
+                self.layer_name,
+                flash.schedule.data_ptr(),
+                flash.query.data_ptr(),
+                fused_cache.data_ptr(),
+                fused_cache.stride(),
+                fused_cache.storage_offset(),
+            )
         latent, _ = flash.adapter.attention(
             flash.query,
             fused_cache,
@@ -2002,6 +2013,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             metadata=flash.schedule,
             attn_mask=flash.attn_mask,
         )
+        if envs.VLLM_ASCEND_FLASH_MLA_TRACE:
+            logger.info(
+                "[FlashMLA TRACE] event=decode_enqueued layer=%s schedule_ptr=%s output_shape=%s",
+                self.layer_name,
+                flash.schedule.data_ptr(),
+                tuple(latent.shape),
+            )
         # Zero unused query rows even if the package leaves their output undefined.
         latent.masked_fill_(~flash.token_live[None, :, None], 0)
         if not self._logged_flashmla_decode:
@@ -2355,6 +2373,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_cache,
                 attn_metadata,
             )
+            if self.external_flashmla_enabled and envs.VLLM_ASCEND_FLASH_MLA_TRACE:
+                logger.info(
+                    "[FlashMLA TRACE] event=prefill_enqueued layer=%s tokens=%s",
+                    self.layer_name,
+                    num_actual_tokens - num_decode_tokens,
+                )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         if gate is not None:

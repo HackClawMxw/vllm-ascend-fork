@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
@@ -173,6 +174,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         with set_current_vllm_config(self.vllm_config):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
         attn_metadata = self.model_runner.model_state.attn_metadata
+        if envs.VLLM_ASCEND_ENABLE_FLASH_MLA and envs.VLLM_ASCEND_FLASH_MLA_TRACE:
+            logger.info("[FlashMLA TRACE] event=target_replay_submit tokens=%s descriptor=%s", num_tokens, desc)
 
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, attn_metadata)

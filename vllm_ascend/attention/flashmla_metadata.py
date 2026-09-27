@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 import torch
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.attention.flashmla import (
     FLASHMLA_MASK_SIZE,
     FLASHMLA_QK_DIM,
@@ -56,6 +57,37 @@ class FlashMLAMetadataBuilder:
         self.executor: DeviceMetadataExecutor | None = None
         self.tasks: tuple[DeviceMetadataTask, ...] = ()
         self.logged_metadata = False
+        self.trace_enabled = envs.VLLM_ASCEND_FLASH_MLA_TRACE
+        self.trace_step = 0
+
+    def _trace(self, event: str, step: int, flash: FlashMLADecode, common, num_decodes: int, has_prefill: bool):
+        # Inspect host-side tensor metadata only: no .cpu(), .item(), value
+        # formatting or device synchronization in this diagnostic path.
+        logger.info(
+            "[FlashMLA TRACE] event=%s builder=%s step=%s device=%s deferred=%s "
+            "decodes=%s mixed=%s tokens=%s rows=%s mask=%s "
+            "source_lengths_ptr=%s source_cu_ptr=%s lengths_ptr=%s cu_ptr=%s "
+            "used_q_ptr=%s table_ptr=%s schedule_ptr=%s query_ptr=%s slots_ptr=%s",
+            event,
+            id(self),
+            step,
+            flash.query.device,
+            self.defer,
+            num_decodes,
+            has_prefill,
+            flash.query.shape[0],
+            flash.cache_lens.shape[0],
+            flash.adapter.config.mask_mode,
+            common.seq_lens.data_ptr(),
+            common.query_start_loc.data_ptr(),
+            flash.cache_lens.data_ptr(),
+            flash.cu.data_ptr(),
+            flash.used_q.data_ptr(),
+            flash.block_table.data_ptr(),
+            flash.schedule.data_ptr(),
+            flash.query.data_ptr(),
+            flash.slots.data_ptr(),
+        )
 
     def _allocate(self, tokens: int, rows: int, columns: int, causal: bool) -> FlashMLADecode:
         ints = {"dtype": torch.int32, "device": self.device}
@@ -103,7 +135,15 @@ class FlashMLAMetadataBuilder:
                 self.buffers[key] = self._allocate(tokens, rows, columns, common.causal)
             flash = self.buffers[key]
 
+        trace_step = 0
+        if self.trace_enabled:
+            self.trace_step += 1
+            trace_step = self.trace_step
+            self._trace("metadata_prepared", trace_step, flash, common, num_decodes, has_prefill)
+
         def refresh():
+            if self.trace_enabled:
+                self._trace("metadata_refresh_begin", trace_step, flash, common, num_decodes, has_prefill)
             # All refreshes belong to the executor task, after its reuse fence.
             # The extra zero-used request owns physical graph/SP padding.
             flash.cu.fill_(tokens)
@@ -133,6 +173,9 @@ class FlashMLAMetadataBuilder:
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
             flash.schedule.copy_(flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q))
+            if self.trace_enabled:
+                # Enqueue success is not device completion or a numerical check.
+                self._trace("metadata_enqueued", trace_step, flash, common, num_decodes, has_prefill)
             if not self.logged_metadata:
                 logger.info("[FlashMLA] metadata_external: device schedule refreshed; deferred=%s", self.defer)
                 self.logged_metadata = True

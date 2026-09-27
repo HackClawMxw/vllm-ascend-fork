@@ -80,3 +80,5 @@ adapter 支持明确指定 `PA_BBND` 或文档拼写 `PA_NZ`；模型接入保�
 提交前检查：全部改动 Python 的 AST 与定向 Ruff 检查通过，31 项 CPU 检查通过。已运行仓库要求的 `bash format.sh ci`：其他 hooks 通过，整体未通过；原因是本机缺少 shellcheck，且 ruff-format 修改了基线 `worker/utils.py` 的两处格式。该无关格式修改已恢复，不混入本功能。没有修改 shell 文件，不将该结果写成全量 CI 通过。
 
 针对 1 号的逐项差异、CPU length 消费者和 `update_graph_params` / replay 时序，见[专项源码复核](flashmla_plan1_comparison.md)。特别注意：Flash Decode 使用设备长度，不代表 runner 的 CPU 镜像/D2H/sync 已全部消除。
+
+首轮验证继续固定运行候选；另有默认关闭的独立诊断提交，增加 metadata 每轮标记、缓冲地址和 target/draft replay 提交标记。开关、证据边界、断点/打桩/profiler/Python 堆栈配合见[诊断手册](flashmla_diagnostics.md)。诊断版不自动替代发布机正在验证的固定 SHA。
