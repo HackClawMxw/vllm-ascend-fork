@@ -19,7 +19,9 @@ FLASHMLA_V_DIM = 512
 FLASHMLA_BLOCK_SIZE = 128
 FLASHMLA_MASK_SIZE = 2048
 FLASHMLA_NZ_INNER_DIM = 16
-FLASHMLA_QUERY_HEADS = (64, 96)
+# Match the existing MLA_FLASH capability gate after tensor parallel sharding.
+# Actual support for each count still requires an NPU operator check.
+FLASHMLA_QUERY_HEADS = (8, 12, 64, 96)
 FLASHMLA_MAX_BATCH_SIZE = 65535
 
 

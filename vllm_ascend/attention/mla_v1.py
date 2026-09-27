@@ -987,7 +987,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if not get_current_hardware_profile().supports(HardwareCapability.MLA_FLASH):
             raise ValueError("External FlashMLA requires an Ascend MLA_FLASH-capable device")
         if self.num_heads not in FLASHMLA_QUERY_HEADS or self.num_kv_heads != 1:
-            raise ValueError("External FlashMLA requires local Q heads 64/96 and one KV head")
+            raise ValueError(f"External FlashMLA requires local Q heads in {FLASHMLA_QUERY_HEADS} and one KV head")
         if self.kv_lora_rank != FLASHMLA_V_DIM or self.qk_rope_head_dim != FLASHMLA_QK_DIM - FLASHMLA_V_DIM:
             raise ValueError("External FlashMLA requires latent512 + positional64 inputs")
         if self.fa_quant_layer or self.dtype not in (torch.bfloat16, torch.float16) or self.enable_kv_nz:

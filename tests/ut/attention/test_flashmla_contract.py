@@ -40,6 +40,17 @@ def make_adapter(api, **kwargs):
     return api.FlashMLAAdapter(config, Mock(), Mock())
 
 
+@pytest.mark.parametrize("heads", (8, 12, 64, 96))
+def test_local_tp_head_counts_pass_to_both_operators(api, inputs, heads):
+    adapter = api.FlashMLAAdapter(api.FlashMLAConfig(heads, 0.125, mask_mode=0), Mock(), Mock())
+    inputs["q"] = torch.empty(3, heads, 576, dtype=torch.bfloat16)
+    adapter.metadata_op.return_value = inputs["metadata"]
+    adapter.build_metadata(inputs["cache_seqlens"], inputs["cu_seqlens_q"], inputs["seqused_q"])
+    adapter.attention(**inputs)
+    assert adapter.metadata_op.call_args.kwargs["num_heads_q"] == heads
+    assert adapter.attention_op.call_args.args[0] is inputs["q"]
+
+
 def test_lengths_and_attributes_match_both_operators(api, inputs):
     adapter = make_adapter(api, return_softmax_lse=True)
     adapter.metadata_op.return_value = inputs["metadata"]
@@ -114,7 +125,7 @@ def test_nz_layout_is_explicit_and_never_reshapes_cache(api, inputs):
 
 @pytest.mark.parametrize(
     "override, match",
-    [({"num_heads": 8}, "local Q heads"), ({"mask_mode": 1}, "mask_mode"), ({"layout_kv": "PA_Nz"}, "layout_kv")],
+    [({"num_heads": 16}, "local Q heads"), ({"mask_mode": 1}, "mask_mode"), ({"layout_kv": "PA_Nz"}, "layout_kv")],
 )
 def test_unsupported_config_is_rejected(api, override, match):
     config = dict(num_heads=64, softmax_scale=1.0)

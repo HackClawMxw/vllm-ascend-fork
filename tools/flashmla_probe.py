@@ -24,7 +24,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--heads", type=int, choices=(64, 96), default=64)
+    parser.add_argument("--heads", type=int, choices=(8, 12, 64, 96), default=64)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--query-len", type=int, default=2)

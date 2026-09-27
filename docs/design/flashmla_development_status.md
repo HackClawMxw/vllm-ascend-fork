@@ -13,7 +13,7 @@
 
 ## 已冻结的接口映射
 
-公开导出为 `cann_ops_transformer.ops.flash_mla_with_kvcache` 和 `flash_mla_with_kvcache_metadata`。Q 为 TND、576 维，输出为 NTD、512 维；BF16/FP16，本地 Q heads 为 64/96、KV heads 为 1、block size 为 128。metadata 和主算子均显式传 `max_seqlen_q=-1`、`max_seqlen_kv=-1`、一致的头数/长度/mask。TND 主动提供 int32 的 `cu_seqlens_q` 和 metadata，`seqused_q` 可选。mask=0 不传 mask；mask=3 传 int8 2048×2048 上三角为 1、其余为 0 的 mask。
+公开导出为 `cann_ops_transformer.ops.flash_mla_with_kvcache` 和 `flash_mla_with_kvcache_metadata`。Q 为 TND、576 维，输出为 NTD、512 维；BF16/FP16，本地 Q heads 为 8/12/64/96、KV heads 为 1、block size 为 128。metadata 和主算子均显式传 `max_seqlen_q=-1`、`max_seqlen_kv=-1`、一致的头数/长度/mask。TND 主动提供 int32 的 `cu_seqlens_q` 和 metadata，`seqused_q` 可选。mask=0 不传 mask；mask=3 传 int8 2048×2048 上三角为 1、其余为 0 的 mask。
 
 adapter 支持明确指定 `PA_BBND` 或文档拼写 `PA_NZ`；模型接入保留 2 号 BBND，不将持久 cache 转成 NZ。长度、block table、metadata 由调用者保证内容正确；接口层仅做不触发设备同步的结构检查。
 
@@ -44,7 +44,7 @@ adapter 支持明确指定 `PA_BBND` 或文档拼写 `PA_NZ`；模型接入保�
 | `0a6d1a320` | MRv2 target 与图生命周期 | capture/replay 外刷新 metadata；消费者结束后记录复用 fence；含 Prefill 的请求不得误命中 Decode FULL 图 |
 | `a8da46c20` | DSpark draft 生命周期 | 独立 executor；按 draft causal 选择 mask；保留 context writer；不套用 FIA 的长度改写 |
 
-**支持范围：** 本轮代码为混部、PCP=1、DCP=1、无 KV transfer、未量化 BF16/FP16、BBND、block128、local Q heads64/96、KV heads1、latent512+positional64。硬件须具备 MLA_FLASH capability。超出范围显式报错。Adapter 的 PA_NZ 合约检查不代表模型已经接入 NZ。TP 配置必须满足本地头数约束；TP/SP、DSpark 实际效果仍待发布机验证。DCP/PCP 扩展、PD 分离和新主线迁移不在这批候选中。
+**支持范围：** 本轮代码为混部、PCP=1、DCP=1、无 KV transfer、未量化 BF16/FP16、BBND、block128、local Q heads8/12/64/96、KV heads1、latent512+positional64。硬件须具备 MLA_FLASH capability。超出范围显式报错。Adapter 的 PA_NZ 合约检查不代表模型已经接入 NZ。TP 配置必须满足本地头数约束；TP/SP、DSpark 实际效果仍待发布机验证。DCP/PCP 扩展、PD 分离和新主线迁移不在这批候选中。
 
 **相对 1 号的主动差异：** Prefill 保留 2 号 FIA 和 chunked/prefix 历史读取；保留 2 号单 backing/BBND strided view、zero/COW；使用公开外部包接口和本任务 `max_seqlen_*=-1` 合约；不复制 1 号 native binding 或整份 runner。现有 FIA host mirrors 保留，未在没有性能证据时删除同步。
 
@@ -88,3 +88,9 @@ adapter 支持明确指定 `PA_BBND` 或文档拼写 `PA_NZ`；模型接入保�
 本轮团队审查进一步发现 eager Decode 按精确形状永久保留 Q/metadata 缓冲的问题，已补最小修复和旧代码失败回归；另记录 DSpark FULL 重复 metadata 的待优化点。详情见[并发审查发现](flashmla_concurrency_findings.md)。这更新了此前仅做接口/图调用链复核时的结论，高并发测试仍需发布机实测。
 
 并发修复候选：`ae92cb43e971f9e7586855b77658101f1f248acd`，仅图容量保留长期缓冲；40 项 CPU 检查通过，包含旧实现确实失败的 eager 缓冲积累回归。发布机扩大并发前按此 SHA 重测基础与图，然后使用分档探测工具。
+
+## TP8 本地 12 头门槛修正
+
+发布机确认 Kimi-K3 全局 96 Q 头、TP8 后为本地 12 头；2 号 A5 MLA capability gate 已包含 8/12/64/96。原外部 adapter 的 64/96 静态门槛会在服务进入真实算子前拒绝这一配置，现已对齐 `flashmla.py`、MLA 报错、合成探针和 CPU 接口检查。**此改动只放通 Python 静态检查，不能证明外部二进制实际支持 12 头。** 发布机先在新 SHA 做单算子 metadata/attention 定向验证，再进入四机 TP8 服务。
+
+发布机先前在固定 `698d00e7c` 的真实 BF16 12 头探针中观察到 metadata 调用 180 秒未返回；该结果发生于本地临时放宽门槛的副本，不能当作原始 PR SHA 通过，也不能判定原因。新 SHA 应记录是否仍卡在 metadata、实际 Python/C++ 堆栈、设备事件及包/OPP 身份，再按失败点最小修复。
