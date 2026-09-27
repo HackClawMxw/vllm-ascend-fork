@@ -1,6 +1,8 @@
 # FlashMLA tiling 下沉：旧主线接入分析与实施计划
 
-状态：2026-09-27，源码分析草稿。当前提交只有本文档，没有接入新算子，也没有 NPU 验证结果。外部算子文档、包及其版本尚待提供；本文中的参考接口不是最终接口约定。
+状态：2026-09-27，源码分析草稿。当前交付仅含分析、交接文档及差异索引，没有接入新算子，也没有 NPU 验证结果。外部算子文档、包及其版本尚待提供；本文中的参考接口不是最终接口约定。
+
+补充入口：[逐项差异与改动清单](flashmla_change_matrix.md)、[另一台机器的执行交接流程](flashmla_handoff.md)、[完整文件差异索引](flashmla_diff_inventory.json)。当前交付均为分析/交接资料，没有 runtime 改动。
 
 ## 1. 固定基线与提交关系
 
@@ -41,7 +43,7 @@
 | 路由和能力检查 | `platform.py`、`envs.py`、MLA impl 检查 A5、dense MLA、dtype 和维度等 | 按新包文档定义能力边界，明确失败或回退策略；不能从开关推导所有层都兼容 |
 | 缓存 | 自有 Flash 路径消费 `[P,S,576]` 并以 `unsqueeze(1)` 传 `PA_BNBD` | 保持 2 号 BBND 协议，不引入 1 号 allocator |
 | metadata builder | 稳定的 Q、schedule、长度、table、slot、positions、live mask；Meta 算子查询 schedule 形状 | 参考生命周期，用外部包自己的 schema/Meta/容量规范 |
-| metadata 调度 | `DeviceMetadataExecutor` 独立 NPU stream，输入就绪、消费等待、复用 fence | 接通目标模型与 draft 各自的 ownership，保证无跨轮覆盖 |
+| metadata 调度 | `DeviceMetadataExecutor` 独立 NPU stream，输入就绪、消费等待、复用 fence；该文件与 2 号基线完全相同 | 复用已有 executor，补 MLA provider 与 MRv2 调用链，保证无跨轮覆盖 |
 | attention | 自带 `torch.ops._C_ascend.flash_mla_with_kvcache` 及 metadata binding | 接用户指定的外部包；不移植私仓 native kernel 或硬编码其 metadata 格式 |
 | prefill | 新增 192/128 非吸收 FlashAttn、分块历史展开及 online merge；保留 absorbed 路径 | 先按新 FlashMLA 合约验证 absorbed 路径，非吸收优化单独评估 |
 | decode | BF16 FlashMLA、可选 MLAPO；另有 C8 分支 | 首轮聚焦文档支持的基础精度，量化与融合优化独立验收 |
@@ -88,7 +90,7 @@ ACLGraph 与 torch.compile/static kernel 是不同层面的能力。算子可 ca
 
 即使 MLA 的 KV head 常为 1，单例维度使数值上看似相同，也不意味着轴语义、stride 检查和 binding 合约相同。写缓存和读 attention 必须共同遵循 2 号物理协议。
 
-需要保持的约束：allocator ownership、raw backing、shape/stride/storage offset、manager block 到 kernel block 的映射、slot/table 编号，以及 zero/COW 的完整物理槽语义。不得通过对持久 cache 调用 `.contiguous()` 掩盖不兼容；这会产生新存储并破坏写回别名及图地址。Q 或临时张量的必要连续化应单独判断。
+需要保持的约束：allocator ownership、raw backing、shape/stride/storage offset、manager block 到 kernel block 的映射、slot/table 编号，以及 2 号现有 zero/COW 语义。更精确地说，V1 zeroer 按物理页建立清零元数据；COW 用 `unflatten` 保留 stride，复制 manager block 覆盖的各 kernel block 的逻辑 payload，不应宣称它复制了所有 padding 字节。MRv2 使用独立的 tuple-aware zeroer，也要单独回归。不得通过对持久 cache 调用 `.contiguous()` 掩盖不兼容；这会产生新存储并破坏写回别名及图地址。Q 或临时张量的必要连续化应单独判断。
 
 ## 7. DSpark、DCP 和容易遗漏的边界
 
