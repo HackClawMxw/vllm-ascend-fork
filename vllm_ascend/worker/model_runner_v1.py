@@ -3689,6 +3689,10 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             extra_attn_metadata_args: dict[str, Any] = {}
+            if getattr(builder, "flashmla_state", None) is not None:
+                # FULL execution must preserve the schedule's ExternalEvent
+                # frontier across capture and replay.
+                extra_attn_metadata_args["retain_for_graph"] = cudagraph_runtime_mode == CUDAGraphMode.FULL
             if isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args["num_actual_reqs"] = num_reqs

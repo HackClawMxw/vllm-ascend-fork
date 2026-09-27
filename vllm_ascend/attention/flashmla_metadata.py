@@ -120,20 +120,27 @@ class FlashMLAMetadataBuilder:
             sin=torch.empty(rope_shape, dtype=self.dtype, device=self.device) if self.use_rope else None,
         )
 
-    def build(self, common, num_decodes: int, num_decode_tokens: int, has_prefill: bool) -> FlashMLADecode:
+    def build(
+        self, common, num_decodes: int, num_decode_tokens: int, has_prefill: bool, *, retain_for_graph: bool = False
+    ) -> FlashMLADecode:
         # Mixed batches run outside FULL graph. Do not retain every prefill
-        # shape. Pure decode keeps addresses stable across changing requests
-        # within the same padded token capacity, including speculative decode.
+        # shape. Retain only explicitly captured decode capacities: retaining
+        # every eager token count grows total query storage quadratically.
+        # Replay (and eager with that capacity) reuses the captured addresses.
         tokens = num_decode_tokens if has_prefill else max(common.num_actual_tokens, common.num_input_tokens)
         rows = num_decodes + 1 if has_prefill else max(num_decodes, min(tokens, self.max_num_reqs)) + 1
         columns = common.block_table_tensor.shape[1]
         key = tokens, rows, columns, common.causal
         if has_prefill:
+            if retain_for_graph:
+                raise ValueError("FlashMLA graph buffers require a decode-only batch")
             flash = self._allocate(tokens, rows, columns, common.causal)
         else:
-            if key not in self.buffers:
-                self.buffers[key] = self._allocate(tokens, rows, columns, common.causal)
-            flash = self.buffers[key]
+            flash = self.buffers.get(key)
+            if flash is None:
+                flash = self._allocate(tokens, rows, columns, common.causal)
+                if retain_for_graph:
+                    self.buffers[key] = flash
 
         trace_step = 0
         if self.trace_enabled:

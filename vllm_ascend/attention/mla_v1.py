@@ -340,7 +340,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     def take_device_metadata_tasks(self):
         return self.flashmla_state.take_tasks() if self.flashmla_state is not None else ()
 
-    def _build_external_flashmla(self, common_prefix_len, common):
+    def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
         state = self.flashmla_state
         assert state is not None
@@ -348,6 +348,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = split_flashmla_requests(
             common
         )
+        if retain_for_graph and self.num_prefills:
+            raise ValueError("FlashMLA full graph capture requires a decode-only batch")
         self.set_num_actual_tokens(common)
         self.block_table = common.block_table_tensor[: common.num_reqs]
         self.slot_mapping = common.slot_mapping[: self.num_actual_tokens]
@@ -366,7 +368,13 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         decode = None
         decode_tokens = self.num_decode_tokens
         if self.num_decodes:
-            flash = state.build(common, self.num_decodes, decode_tokens, self.num_prefills > 0)
+            flash = state.build(
+                common,
+                self.num_decodes,
+                decode_tokens,
+                self.num_prefills > 0,
+                retain_for_graph=retain_for_graph,
+            )
             decode_tokens = flash.query.shape[0]
             decode = self.decode_metadata_cls(
                 input_positions=flash.positions,
@@ -541,9 +549,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
+        retain_for_graph: bool = False,
     ) -> AscendMLAMetadata:
         if self.flashmla_state is not None:
-            return self._build_external_flashmla(common_prefix_len, common_attn_metadata)
+            return self._build_external_flashmla(
+                common_prefix_len, common_attn_metadata, retain_for_graph=retain_for_graph
+            )
         expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
@@ -840,6 +851,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             capture_metadata.attn_state = AscendAttentionState.ChunkedPrefill
         if (self.dcp_enabled or envs.VLLM_ASCEND_ENABLE_FLASH_MLA) and capture_metadata.is_prefilling is None:
             capture_metadata.is_prefilling = torch.zeros(capture_metadata.num_reqs, dtype=torch.bool)
+        if self.flashmla_state is not None:
+            assert capture_metadata.num_reqs <= capture_metadata.num_actual_tokens * self.reorder_batch_threshold
+            assert capture_metadata.max_query_len <= self.reorder_batch_threshold
+            return self._build_external_flashmla(0, capture_metadata, retain_for_graph=True)
         return super().build_for_cudagraph_capture(capture_metadata)
 
     def build_for_graph_capture(
@@ -851,10 +866,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             if self.flashmla_state is not None:
                 common_attn_metadata = copy(common_attn_metadata)
                 common_attn_metadata.is_prefilling = torch.zeros(common_attn_metadata.num_reqs, dtype=torch.bool)
-            attn_metadata = self.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
+                attn_metadata = self._build_external_flashmla(0, common_attn_metadata, retain_for_graph=True)
+            else:
+                attn_metadata = self.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                )
         else:
             raise NotImplementedError(
                 "Currently we only support building dummy metadata for DecodeOnly and SpecDecoding state"
