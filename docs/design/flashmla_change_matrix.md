@@ -2,6 +2,8 @@
 
 本文是接入前的源码分析，不是已经实现的改动列表。固定 SHA、调用链和参数待确认项见 [总体分析](flashmla_tiling_oldmain.md)，执行顺序见 [交接流程](flashmla_handoff.md)。
 
+**当前执行要求：先做 PD 混部，prefill 保留 FIA，decode 接外部 FlashMLA，共用 2 号非连续 cache。PD 分离暂不推进。** 下表描述 1 号更广的实现不代表照搬；此前将 absorbed prefill 接入 FlashMLA 的计划已取消。布局选择还须满足 eligibility，包括无 KV transfer，不能仅按 A5/head 数判断。
+
 ## 比较口径
 
 1 号是大范围 K3/A5 集成，2 号 PR 自身聚焦缓存协议；2 号所在底座本来就有 FIA、DCP、DSpark、图模式等功能。因此“2 号 PR 没有新增”不等于“2 号分支没有这个能力”。
@@ -60,7 +62,7 @@ N=1 时 BBND/BNBD 的单例轴可能使元素地址看似等价，但 shape、st
 
 | ID | 2 号现状 | 1 号对应实现 | 本次拟改动 / 处理 | 主要文件 |
 | --- | --- | --- | --- | --- |
-| F01 | MLA 已有 FIA backend；缓存 capability 不等于选中 Flash | 全局 Flash 开关联动 platform、MLA 与 GQA | 接入外部包能力检查和 MLA 路由；避免误改其他 backend | `platform.py`、`envs.py`、`attention/mla_v1.py` |
+| F01 | MLA 已有 FIA backend；缓存 capability 不等于选中 Flash | 全局 Flash 开关联动 platform、MLA 与 GQA | 接入按阶段分流的 MLA decode 路由；prefill 保留 FIA，mixed batch 分开处理；不能全局跳转 `_forward_flash` | `platform.py`、`envs.py`、`attention/mla_v1.py` |
 | F02 | 没有本次新包的 FlashMLA adapter | MLA 使用 `_C_ascend` 自带 binding | 新建最小 adapter，直接遵守外部包 schema；实际文件名实施时确定 | adapter、包加载入口 |
 | F03 | 原 FIA 预处理得到分离 Q NoPE/positional | absorbed Q 拼成 576 维；使用实际 head 数 | 接通 Q absorption 与输入 layout，不复制额外 head replication | `attention/mla_v1.py` |
 | F04 | 原路径经 slices 写 fused/component KV | Flash 路径 scatter 写融合 cache 的两个分量 | 适配新路径 KV 写入，验证 stride、offset、无效 slot 与 NoPE/RoPE | `attention/mla_v1.py` |
@@ -69,7 +71,7 @@ N=1 时 BBND/BNBD 的单例轴可能使元素地址看似等价，但 shape、st
 | F07 | **已有 `DeviceMetadataExecutor`** | **同一文件、相同 Git blob** | **复用，不新建、不整体覆盖**；补 MLA task provider | `worker/device_metadata.py`、MLA builder |
 | F08 | MRv1 已有 provider 收集、submit、forward context 与 release | Flash builder 挂接同一机制 | 扩展 MLA provider；保留 2 号已有生命周期修复 | `worker/model_runner_v1.py` |
 | F09 | MRv2 当前没有参考分支的 Flash executor/context 接线 | target executor、builder 收集 task、图外 submit/wait、finally release | 接入 MRv2 target 生命周期，兼顾异常和 buffer fence | `worker/v2/model_runner.py`、`attn_utils.py` |
-| F10 | MLA decode 调 FIA v2 | FlashMLA 读 paged KV 与 schedule | 替换选中路径核心 attention；传参按包验证 | `attention/mla_v1.py` |
+| F10 | MLA decode 调 FIA v2 | FlashMLA 读 paged KV 与 schedule | 仅替换选中的 decode 核心 attention；传参按包验证，prefill 不切换 | `attention/mla_v1.py` |
 | F11 | 既有 V 升维、gate、O projection | Flash 输出按 TND/NTD 和 merge 需求分流 | 对齐输出轴、V=512 latent 与现有投影；保留 TP 语义 | `attention/mla_v1.py` |
 | F12 | 既有 padding 和 FIA 长度约束 | 额外零长度 request、`token_live`、`slot=-1`、输出 mask | 接入新包允许的 padding 规则，验证空行和残留数据 | builders、输出处理 |
 | F13 | FIA graph 参数/handle/workspace 更新 | Flash MLA updater 跳过，稳定 buffer 提供新输入 | 在前置刷新完成后仅跳过选中 Flash 路径；保留其他 backend updater | MLA updater、`compilation/acl_graph.py` |
@@ -80,11 +82,11 @@ N=1 时 BBND/BNBD 的单例轴可能使元素地址看似等价，但 shape、st
 | F18 | DSpark query/capture 已有通路 | draft 独立 executor、positions、causal/query metadata 接线 | 接入 MLA draft 的 metadata 与 capture；不能硬设 causal | `worker/v2/spec_decode/dspark/speculator.py`、`dflash/aclgraph.py` |
 | F19 | 基线已有 MLA DCP，包括 FIA history/current 路径 | Flash history/current + output/LSE exchange/merge | 分阶段迁移计算接口，复用分布式语义；验证当前 KV 恰计一次 | `attention/context_parallel/mla_cp.py`、`common_cp.py` |
 | F20 | 既有 TP head ownership 与 projection | 额外 Q replication、通信 overlap、融合 gate/O 投影 | 暂不导入性能优化；先保持当前 TP 输出一致 | `models/kimi_k3.py`、MLA impl、Triton helpers |
-| F21 | prefill 用已有 FIA/展开路径 | absorbed FlashMLA 和额外 192/128 非吸收 FlashAttn | 先按包支持范围接 absorbed；非吸收路径独立评估 | `attention/mla_v1.py`、`mla_prefill.py` |
+| F21 | prefill 用已有 FIA/展开路径 | absorbed FlashMLA 和额外 192/128 非吸收 FlashAttn | 明确保留 FIA prefill；验证 prefix-hit、chunked、短 prefill、mixed 分流及 prefill→decode cache 交接；不导入 1 号 prefill 替换 | `attention/mla_v1.py` |
 | F22 | 已有 MLAPO/其他 fused preprocess policy；fused cache 有保护 | 1 号扩展 NoPE/原生前处理及权重路径 | 首轮普通前处理验证正确，后续按 stride 合约启用融合 | `attention/mla_v1.py`、`ops/mla.py` |
 | F23 | 其他 attention 使用自身 backend/cache | 1 号 Flash 开关也接 GQA FlashAttn/head-slot packing | 暂不导入；GQA draft 是否需要属于另一个明确范围 | `attention/attention_v1.py`、platform、draft |
 | F24 | 本次尚无外部 C8 合约 | C8 cache、量化准备、native metadata 与输出格式 | 暂不导入，避免改变 2 号 cache 存储协议 | `worker/flash_kv_cache.py`、C8 ops/native |
-| F25 | 旧基线已有 PCP/PD 等实现 | 1 号另有通信、传输、启动顺序和相关优化 | 按部署需求逐项验证，不把整套运行环境搬入最小接入 | transfer、runner、platform |
+| F25 | 已有旧协议 PD；新增 single-backing 路径明确排除 KV transfer | 1 号另有 Flash 传输、通信和启动适配 | 当前先验证无 KV transfer 的 PD 混部；分离调查留作备查，不扩展传输协议 | transfer、runner、platform |
 | F26 | 原有 KDA/MoE/Mamba/PP 代码 | 1 号含大量独立优化及修复 | 暂不导入，除非后续能证明是接入的必要依赖 | 对应模块与 native kernels |
 
 F07 的同一 blob 为 `0f5eed70fb957384fb62c769408889a5effc92c4`。F17 的 context 写入调用在两边都存在；需要改变的是算子路径对 cache 的消费方式，不能把整条 DSpark 功能记成新引入。

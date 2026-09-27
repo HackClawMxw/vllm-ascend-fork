@@ -4,6 +4,12 @@
 
 补充入口：[逐项差异与改动清单](flashmla_change_matrix.md)、[另一台机器的执行交接流程](flashmla_handoff.md)、[完整文件差异索引](flashmla_diff_inventory.json)。当前交付均为分析/交接资料，没有 runtime 改动。
 
+**当前确定的执行范围：PD 混部，prefill 使用 FIA，decode 接入外部 FlashMLA；非连续缓存继续使用 2 号方案。PD 分离暂不推进。** 本文对 1 号的描述是参考分析，不能覆盖这项用户要求；此前拟将 absorbed prefill 一起接入 FlashMLA 的计划已取消。
+
+必须满足的路由约束：纯 prefill、chunked prefill、prefix-hit prefill 均保留 FIA；纯 decode 使用新 FlashMLA；mixed batch 分别处理 prefill/decode 部分后按原 token 顺序写回。两条路径读写同一份 2 号 cache，验证 prefill 写入后 decode 能正确读取。不能按一个全局开关直接把整个 `forward` 跳转到 1 号 `_forward_flash`，也不能仅按 Q 长度将短 prefill 当作 Flash decode。具体阶段判定应核对 scheduler/attention metadata 的实际语义。
+
+保留 FIA prefill 也意味着不能照搬 1 号全局 `use_fia=False`、清空 CPU 长度或跳过所有 FIA 图更新的逻辑。必须保留 prefill 及其他 FIA 消费者所需的 metadata/同步，仅对已证明独立的 Flash decode 部分做下沉。mixed batch 的 query boundaries、输出位置和 gate/O 投影次数也要按两部分接口对齐。
+
 ## 1. 固定基线与提交关系
 
 | 用途 | 固定版本 | 处理原则 |
@@ -20,7 +26,7 @@
 
 ## 2. FlashMLA 替换的是什么
 
-结论：在选中的 dense MLA 执行路径内，FlashMLA 接替 FIA 的 attention 核心计算；MLA 整层的前后处理仍必须正确接通。
+当前目标：仅在选中的 dense MLA decode 路径内，FlashMLA 接替 FIA 的 attention 核心计算；prefill 保留 FIA。两条路径的前后处理和共享缓存仍必须正确接通。下面分析 1 号时涉及其更广的 prefill 替换，不代表本次采用。
 
 2 号当前 `AscendMLAImpl.forward` 将 fused cache 零拷贝切成 NoPE/RoPE logical views，沿已有预处理、FIA 和输出路径执行。decode 核心调用是 `torch_npu.npu_fused_infer_attention_score_v2`；prefill 也有 FIA 调用。缓存已经 fused，不代表 attention 已经切到 FlashMLA。
 
@@ -45,7 +51,7 @@
 | metadata builder | 稳定的 Q、schedule、长度、table、slot、positions、live mask；Meta 算子查询 schedule 形状 | 参考生命周期，用外部包自己的 schema/Meta/容量规范 |
 | metadata 调度 | `DeviceMetadataExecutor` 独立 NPU stream，输入就绪、消费等待、复用 fence；该文件与 2 号基线完全相同 | 复用已有 executor，补 MLA provider 与 MRv2 调用链，保证无跨轮覆盖 |
 | attention | 自带 `torch.ops._C_ascend.flash_mla_with_kvcache` 及 metadata binding | 接用户指定的外部包；不移植私仓 native kernel 或硬编码其 metadata 格式 |
-| prefill | 新增 192/128 非吸收 FlashAttn、分块历史展开及 online merge；保留 absorbed 路径 | 先按新 FlashMLA 合约验证 absorbed 路径，非吸收优化单独评估 |
+| prefill | 新增 192/128 非吸收 FlashAttn、分块历史展开及 online merge；保留 absorbed 路径 | 保留 2 号 FIA prefill，不引入 absorbed FlashMLA prefill 或非吸收 FlashAttn prefill |
 | decode | BF16 FlashMLA、可选 MLAPO；另有 C8 分支 | 首轮聚焦文档支持的基础精度，量化与融合优化独立验收 |
 | DCP | 本地历史 KV、Q 汇聚或复制、当前块、output/LSE 合并 | 后续独立里程碑；不能只将 DCP size 传给算子就认为完成 |
 | DSpark | 独立 executor、context KV 写入、query metadata 与 capture 路径 | 分开审查 target 和 draft；按实际 MLA/GQA 架构处理 |
@@ -84,6 +90,8 @@ ACLGraph 与 torch.compile/static kernel 是不同层面的能力。算子可 ca
 
 2 号当前 MRv2 为具备 `MLA_FLASH` 能力且 Q heads 属于 `{8,12,64,96}` 的路径建立 token-fused cache：`[P,B,N,576]`，即 BBND。每个 token 的最后一维是 `[latent512 | positional64]`，页首 stride 可以大于页 payload，storage offset 也可能非零。
 
+上述描述还有前置条件：不配置 KV transfer、普通未量化 dense MLA、匹配 spec/layer 类型等。当前先按无 KV transfer 的混部场景验证，不扩大该条件的支持范围。
+
 对于 A3/FIA 等路径，2 号保留 component-major NoPE/RoPE views；同一 raw backing 内两部分分别组织，padding 体现在页跨度。不能将这种布局伪装成 token-fused tensor。
 
 1 号传给算子的 `PA_BNBD` 是 `[P,N,B,D]`；本次需要优先检查新包是否直接支持 `PA_BBND`。如果必须换轴，也只能在包明确接受对应 stride 时构造存储别名，不能假定一次 `view` 或改 layout 字符串即可适配。
@@ -101,6 +109,8 @@ target 和 draft 需要独立的 metadata 缓冲、executor 和 config 作用域
 DCP 模式下，1 号把 causal attention 拆为历史和当前块：历史使用各 rank 的本地 KV 长度；当前块按相应复制策略计算；之后用 output/LSE 合并。直接平均 output 是错误的，重复计入当前 token 也会错误。Q head ownership、TP shard、当前块暂存 cache、通信输出和空 rank 都需要验证。
 
 PCP、PD/KV transfer、KVPP、量化 C8、非吸收 prefill、Q replication、融合 gate/O-proj 等都可能与接入相交，但不应未经依赖分析整包引入。首轮选择 PCP=1/DCP=1 基础路径是实施顺序，不是对新算子能力的断言。其余配置必须显式路由或报错，不能静默使用未经验证的路径。
+
+PD 分离不在当前阶段范围；后续用户恢复此范围时再使用保留的调查资料。本轮先证明混部中的 FIA prefill → 同一非连续 cache → FlashMLA decode 链正确。
 
 ## 8. 收到算子文档后的参数核对表
 
@@ -121,10 +131,10 @@ PCP、PD/KV transfer、KVPP、量化 C8、非吸收 prefill、Q replication、�
 
 1. **本次：基线和分析。** 拉取固定版本，建立新开发分支及两个 draft；记录执行链、差异与待确认合约。本次只交付文档。
 2. **接口适配。** 对照新文档逐项填写参数表，实现最小外部包 adapter 和能力检查；用真实包验证导入、schema、Meta 和参数路由。模拟测试只能证明 host 合约，不能证明算子可用。
-3. **基础 eager。** 在 2 号布局上接通 Q/KV 准备、cache 写入、metadata、FlashMLA、V/O 投影。依次验证 decode、prefill、prefix cache、chunked/mixed batch；先使用 PCP=1/DCP=1、无 speculative 的基准配置。
+3. **混部基础 eager。** 保留 FIA prefill，在 2 号布局上接通 decode 的 Q/KV 准备、cache 写入、metadata、FlashMLA、V/O 投影。验证纯 prefill 仍调用 FIA、纯 decode 调用 FlashMLA、prefill→decode 共享 cache，以及 prefix-hit/chunked/短 prefill 和 mixed batch 分流；先使用 PCP=1/DCP=1、无 speculative 的基准配置。
 4. **图模式。** 先 MRv2 target 的 capture/replay，再独立处理 MRv1 的事件语义。验证稳定地址、跨轮 fence、不同 batch 档、padding、请求增删/重排；保留非 Flash 层的现有图更新。
 5. **DSpark。** 接通 context 写入与 draft query/capture；分别验证 target/draft metadata、noncausal 语义、接受/拒绝 token 后的下一轮长度，再组合 FULL 图验证。
-6. **并行与性能。** 按目标部署需求扩展 DCP/TP/SP，之后评估 PD/PCP 和额外优化。测量 metadata、host 同步、attention kernel 及整步耗时，不以 kernel 降幅替代端到端 ITL。
+6. **混部并行与性能。** 按目标部署需求扩展 DCP/TP/SP 和所需 PCP；prefill 始终保持 FIA，PD 分离另行恢复范围后再处理。测量 metadata、host 同步、decode attention kernel 及整步耗时，不以 kernel 降幅替代端到端 ITL。
 7. **旧基线收敛与新主线迁移。** 旧基线测试通过后整理最小增量；再适配 VA 新主线，重新核对 vLLM/VA API、cache contract 和图执行流程，不把旧基线通过视为新主线通过。
 
 测试至少覆盖：文档支持的 head/dtype/block 组合、不同 Q/KV 长度、非连续页、非零 offset、zero/COW 与相邻页保护、当前 KV 可见性、同图变输入、空/填充行及 speculative rejection。精度阈值从算子文档与模型验证约定确定，cache 写入和保护区比较要求精确。长上下文和特殊维度是否支持须有真实包证据。
