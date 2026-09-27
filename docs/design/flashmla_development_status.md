@@ -82,3 +82,9 @@ adapter 支持明确指定 `PA_BBND` 或文档拼写 `PA_NZ`；模型接入保�
 针对 1 号的逐项差异、CPU length 消费者和 `update_graph_params` / replay 时序，见[专项源码复核](flashmla_plan1_comparison.md)。特别注意：Flash Decode 使用设备长度，不代表 runner 的 CPU 镜像/D2H/sync 已全部消除。
 
 首轮验证继续固定运行候选；另有默认关闭的独立诊断提交，增加 metadata 每轮标记、缓冲地址和 target/draft replay 提交标记。开关、证据边界、断点/打桩/profiler/Python 堆栈配合见[诊断手册](flashmla_diagnostics.md)。诊断版不自动替代发布机正在验证的固定 SHA。
+
+主力机已按用户要求启动审查、生命周期检查和并发工具三个子代理，主 agent 统一整合；发布机继续按当地 skill 拉起和验证固定版本。职责、高并发阶梯、故障打桩点和修复闭环见[双机与 agent team 分工](flashmla_team_workflow.md)。
+
+本轮团队审查进一步发现 eager Decode 按精确形状永久保留 Q/metadata 缓冲的问题，已补最小修复和旧代码失败回归；另记录 DSpark FULL 重复 metadata 的待优化点。详情见[并发审查发现](flashmla_concurrency_findings.md)。这更新了此前仅做接口/图调用链复核时的结论，高并发测试仍需发布机实测。
+
+并发修复候选：`ae92cb43e971f9e7586855b77658101f1f248acd`，仅图容量保留长期缓冲；40 项 CPU 检查通过，包含旧实现确实失败的 eager 缓冲积累回归。发布机扩大并发前按此 SHA 重测基础与图，然后使用分档探测工具。
