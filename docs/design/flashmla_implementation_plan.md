@@ -1,6 +1,6 @@
 # FlashMLA Decode 接入设计 v1：逐项实施与验收
 
-设计日期：2026-09-27。基线为 `a583897e`，参考为 `de31c53d`，版本和需求以[会话结论](flashmla_session_decisions.md)为准。本文是一版待外部包合约补齐的实施设计；下面的步骤均未实现，拟新增文件/符号不是已存在的 API。
+设计日期：2026-09-27。基线为 `a583897e`，参考为 `de31c53d`，版本和需求以[会话结论](flashmla_session_decisions.md)为准。本文保留初版设计与验收条件。当前运行代码已按模块提交，实际文件、合约、支持范围和待测项以[开发记录](flashmla_development_status.md)为准；代码完成不等于下表验收通过。用户已调整为主力机先完成代码、发布机随后集中验证。
 
 当前架构决定：Prefill 保留 FIA，Decode 接指定外部 FlashMLA，两个阶段共用 2 号非连续 cache。首轮按未量化、PCP=1、DCP=1、无 speculative 的混部路径推进，具体芯片、head、block、dtype 和 TP 配置由包文档及实际模型确定。DSpark/DCP 在基础路径之后独立验收；PD 分离暂不推进。
 

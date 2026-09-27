@@ -1,6 +1,6 @@
 # FlashMLA 另一台机器的执行交接流程
 
-当前阶段只确定流程与差异。外部算子说明、安装包、模型/硬件信息以及启动测试 skill 在另一台机器，后续由用户补充。不在本机猜测安装步骤、设备地址、模型路径或启动命令。
+当前已从分析进入运行代码候选：主力机完成代码，发布机负责部署和集中验证。首先阅读[开发记录与命中证据](flashmla_development_status.md)，其中记录实际提交、冻结合约、支持范围和检查位置。外部包二进制、模型/硬件信息和启动测试 skill 仍由发布机核实；不猜测安装步骤、设备地址、模型路径或启动命令。
 
 **接手机器必须遵守的当前需求：PD 混部；prefill 保留 FIA，decode 接外部 FlashMLA；沿用 2 号非连续缓存。PD 分离暂不推进。** 禁止按 1 号全局 Flash 分支将 prefill/decode 一起切换；mixed batch 按实际阶段分别执行，并共用同一份缓存。此前 absorbed FlashMLA prefill 的计划已取消。
 
@@ -62,10 +62,10 @@ git status --short
 
 精度阈值和实际启动/测试命令以外部文档及当地 skill 确定。持久 cache 的正确写入与非目标区域保护应做精确比较。CPU 测试通过不能写成 NPU 或服务通过；参考 PR 的历史测量不能写成本候选结果。
 
-当前环境只运行了文档检查，不具备本任务的 NPU 验收证据。本机 `format.sh ci` 因缺少 `pre-commit` 未能运行，接手机器需要按仓库和 skill 补齐适用检查。
+当前主力机已运行 CPU 接口/阶段检查和静态检查，不具备 NPU 验收证据。最新检查结果见开发记录和 PR 留言；发布机按仓库和当地 skill 补齐运行验证。
 
 验收增加路由证据：确认 prefill 请求实际调用 FIA，decode 实际调用 FlashMLA；mixed batch 两部分均有正确调用。特别检查短 prefill 的阶段识别，不能仅依据 query length/decode threshold 推断阶段。DSpark context 写入不等于 prefill attention，draft query 的路由按独立语义核对。
 
 ## 可交给另一台机器的任务说明
 
-> 继续 `Henry-Avery/vllm-ascend:codex/flashmla-tiling-oldmain-v2` 上的 FlashMLA tiling 下沉任务。当前先验证 PD 混部：prefill 必须保留 FIA，decode 接指定外部 FlashMLA，mixed batch 按阶段分流并共用 2 号非连续缓存；不要照搬 1 号将整个 forward 切到 FlashMLA，PD 分离暂不推进。先读取 `docs/design/flashmla_handoff.md`、`flashmla_session_decisions.md`、`flashmla_implementation_plan.md`、总体分析和逐项清单，再读取我提供的算子文档与本机启动测试 skill。以 `a583897e` 的 2 号缓存协议为基线，参考固定 `de31c53d` 的 1 号 decode/metadata 流程。先核实真实阶段与排序，避免短 prefill 被 decode_threshold 误分流；复用原 prefill writer，不添加 attention 后 cache 重排。复用已有 DeviceMetadataExecutor，逐项适配 MLA/MRv2/图/DSpark，不覆盖 allocator。先冻结合约和验证基线，再按设计 01–10 一点一提交，验证并解释清楚后改下一处。必须提供 FIA prefill→共享 cache→FlashMLA decode 的路由和正确性证据；将真实结果、未覆盖项和最小代码增量推到同一分支，更新 PR #6 和个人备份 PR #10。最终再适配 VA 新主线。
+> 发布机先拉取并验证主力机候选；不从头重复实施，也不未经协调覆盖共享开发分支。具体提交和命中证据见开发记录。继续 `Henry-Avery/vllm-ascend:codex/flashmla-tiling-oldmain-v2` 上的 FlashMLA tiling 下沉任务。当前先验证 PD 混部：prefill 必须保留 FIA，decode 接指定外部 FlashMLA，mixed batch 按阶段分流并共用 2 号非连续缓存；不要照搬 1 号将整个 forward 切到 FlashMLA，PD 分离暂不推进。先读取 `docs/design/flashmla_handoff.md`、`flashmla_session_decisions.md`、`flashmla_implementation_plan.md`、总体分析和逐项清单，再读取我提供的算子文档与本机启动测试 skill。以 `a583897e` 的 2 号缓存协议为基线，参考固定 `de31c53d` 的 1 号 decode/metadata 流程。先核实真实阶段与排序，避免短 prefill 被 decode_threshold 误分流；复用原 prefill writer，不添加 attention 后 cache 重排。复用已有 DeviceMetadataExecutor，逐项适配 MLA/MRv2/图/DSpark，不覆盖 allocator。先冻结合约和验证基线，再按设计 01–10 一点一提交，验证并解释清楚后改下一处。必须提供 FIA prefill→共享 cache→FlashMLA decode 的路由和正确性证据；将真实结果、未覆盖项和最小代码增量推到同一分支，更新 PR #6 和个人备份 PR #10。最终再适配 VA 新主线。
