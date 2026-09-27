@@ -388,9 +388,11 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
-        self.cudagraph_manager.flashmla_has_prefill = bool(
-            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
-        )
+        # Memory profiling runs before initialize_kv_cache creates the manager.
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.flashmla_has_prefill = bool(
+                ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
+            )
         if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
             # The upstream length-based ordering may interleave short prompt
             # suffixes with decode. Reorder every request field together before
