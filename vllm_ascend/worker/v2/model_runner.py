@@ -340,7 +340,14 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        with pcp_dispatch_context(), flashmla_metadata_scope(self.attn_groups, self.flashmla_executor):
+        # Initial memory profiling skips attention before KV cache initialization
+        # creates the groups. Other runs still require initialized builders.
+        attn_groups = getattr(self, "attn_groups", None)
+        if attn_groups is None:
+            if not (dummy_run and is_profile and skip_attn_for_dummy_run):
+                raise RuntimeError("MRv2 attention groups are unavailable outside initial memory profiling")
+            attn_groups = ()
+        with pcp_dispatch_context(), flashmla_metadata_scope(attn_groups, self.flashmla_executor):
             output = super().execute_model(
                 scheduler_output,
                 intermediate_tensors=intermediate_tensors,

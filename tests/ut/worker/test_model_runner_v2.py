@@ -31,6 +31,7 @@ def _make_runner(need_timing: bool = True):
     runner.execute_model_state = None
     runner.is_last_pp_rank = False
     runner.attn_groups = []
+    runner.flashmla_executor = None
     runner.adaptive_verification = None
     runner.use_fia = False
     return runner
@@ -67,6 +68,26 @@ def test_execute_model_records_profiling_time():
     if not vllm_version_is("0.29.0"):
         expected_kwargs["valid_dummy_state_slots"] = False
     mock_execute_model.assert_called_once_with(scheduler_output, **expected_kwargs)
+
+
+def test_profile_dummy_run_before_attention_groups_init():
+    runner = _make_runner(need_timing=False)
+    del runner.attn_groups
+    runner.flashmla_executor = object()
+    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
+
+    with patch.object(GPUModelRunner, "execute_model", return_value=None) as mock_execute_model:
+        runner.execute_model(
+            scheduler_output,
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    mock_execute_model.assert_called_once()
+
+    with pytest.raises(RuntimeError, match="attention groups are unavailable"):
+        runner.execute_model(scheduler_output)
 
 
 def test_execute_model_disables_profiling_timer_and_clears_stale_time():
