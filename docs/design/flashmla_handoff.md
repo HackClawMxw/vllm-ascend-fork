@@ -11,7 +11,7 @@
 - 旧基线：`a583897e0c67d9c23288686728124b04b511a462`，目标 `HackClawMxw/vllm-ascend-fork:0913main`。
 - 目标 draft：[PR #6](https://github.com/HackClawMxw/vllm-ascend-fork/pull/6)；个人备份：[PR #10](https://github.com/Henry-Avery/vllm-ascend/pull/10)。两个 PR 共享 head，继续推送同一分支即可更新。
 - 1 号固定参考：`maoxx241/vllm-ascend-rfc16468-private` 的 `de31c53dc5b94ff246b17aa198404a082162c2f9`；需要该私仓读取权限。不能直接替换成当时最新 head。
-- 阅读顺序：[总体分析](flashmla_tiling_oldmain.md) → [逐项清单](flashmla_change_matrix.md) → 外部算子文档 → 当地启动测试 skill。
+- 阅读顺序：[会话结论](flashmla_session_decisions.md) → [总体分析](flashmla_tiling_oldmain.md) → [逐项清单](flashmla_change_matrix.md) → 外部算子文档 → 当地启动测试 skill。
 
 当前使用 `kv_transfer_config=None` 的混部场景，不扩大 2 号新布局的 transfer 支持范围。prefill FIA 与 decode FlashMLA 必须消费同一缓存协议，不能靠阶段切换时重新分配/复制持久 cache 来隐藏不兼容。
 

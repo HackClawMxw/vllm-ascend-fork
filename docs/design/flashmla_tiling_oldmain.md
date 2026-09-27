@@ -4,6 +4,8 @@
 
 补充入口：[逐项差异与改动清单](flashmla_change_matrix.md)、[另一台机器的执行交接流程](flashmla_handoff.md)、[完整文件差异索引](flashmla_diff_inventory.json)。当前交付均为分析/交接资料，没有 runtime 改动。
 
+会话中的最终需求、撤回的假设及 Prefill/reshape/cache 写入顺序统一保存在[会话结论](flashmla_session_decisions.md)。
+
 **当前确定的执行范围：PD 混部，prefill 使用 FIA，decode 接入外部 FlashMLA；非连续缓存继续使用 2 号方案。PD 分离暂不推进。** 本文对 1 号的描述是参考分析，不能覆盖这项用户要求；此前拟将 absorbed prefill 一起接入 FlashMLA 的计划已取消。
 
 必须满足的路由约束：纯 prefill、chunked prefill、prefix-hit prefill 均保留 FIA；纯 decode 使用新 FlashMLA；mixed batch 分别处理 prefill/decode 部分后按原 token 顺序写回。两条路径读写同一份 2 号 cache，验证 prefill 写入后 decode 能正确读取。不能按一个全局开关直接把整个 `forward` 跳转到 1 号 `_forward_flash`，也不能仅按 Q 长度将短 prefill 当作 Flash decode。具体阶段判定应核对 scheduler/attention metadata 的实际语义。
