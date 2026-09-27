@@ -46,6 +46,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -378,6 +379,19 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
+            # The upstream length-based ordering may interleave short prompt
+            # suffixes with decode. Reorder every request field together before
+            # positions, slots, tables and sampling indices are constructed.
+            order = np.argsort(batch_state.is_prefilling_np, kind="stable")
+            batch_state = batch_state._replace(
+                req_ids=[batch_state.req_ids[index] for index in order],
+                num_scheduled_tokens=batch_state.num_scheduled_tokens[order],
+                idx_mapping_np=batch_state.idx_mapping_np[order],
+                prefill_len_np=batch_state.prefill_len_np[order],
+                num_computed_prefill_tokens_np=batch_state.num_computed_prefill_tokens_np[order],
+                is_prefilling_np=batch_state.is_prefilling_np[order],
+            )
         num_tokens = None
         if vllm_version_is("0.28.0") and self.pcp_manager is not None and batch_state is not None:
             num_tokens = self.pcp_manager.get_num_tokens_for_dispatch(

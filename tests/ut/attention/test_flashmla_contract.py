@@ -176,9 +176,11 @@ def test_loader_imports_public_package_only_when_requested(api):
 @pytest.mark.parametrize("missing", ["package", "symbol"])
 def test_missing_package_or_symbol_has_actionable_error(api, missing):
     importer = Mock(side_effect=ImportError("absent")) if missing == "package" else Mock(return_value=SimpleNamespace())
-    with patch.dict(api.FlashMLAAdapter.load.__func__.__globals__, import_module=importer):
-        with pytest.raises(RuntimeError, match="Install a package matching"):
-            api.FlashMLAAdapter.load(api.FlashMLAConfig(64, 1.0))
+    with (
+        patch.dict(api.FlashMLAAdapter.load.__func__.__globals__, import_module=importer),
+        pytest.raises(RuntimeError, match="Install a package matching"),
+    ):
+        api.FlashMLAAdapter.load(api.FlashMLAConfig(64, 1.0))
 
 
 def test_kernel_error_propagates_without_fallback_or_retry(api, inputs):
@@ -187,3 +189,16 @@ def test_kernel_error_propagates_without_fallback_or_retry(api, inputs):
     with pytest.raises(RuntimeError, match="unsupported token stride"):
         adapter.attention(**inputs)
     assert adapter.attention_op.call_count == 1
+
+
+def test_short_prefill_uses_real_phase_and_rejects_interleaved_requests(api):
+    common = SimpleNamespace(
+        num_reqs=3,
+        num_actual_tokens=3,
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, True, True]),
+    )
+    assert api.split_flashmla_requests(common) == (1, 2, 1, 2)
+    common.is_prefilling = torch.tensor([True, False, True])
+    with pytest.raises(RuntimeError, match="runner ordering"):
+        api.split_flashmla_requests(common)

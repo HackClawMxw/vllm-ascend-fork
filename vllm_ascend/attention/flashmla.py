@@ -23,6 +23,32 @@ FLASHMLA_QUERY_HEADS = (64, 96)
 FLASHMLA_MAX_BATCH_SIZE = 65535
 
 
+def split_flashmla_requests(common) -> tuple[int, int, int, int]:
+    """Split real generation stages after the runner's stable phase ordering.
+
+    Read only CPU scheduler metadata. A one-token prompt suffix is still FIA
+    prefill; query length alone must never opt a request into FlashMLA.
+    """
+    flags = common.is_prefilling
+    offsets = common.query_start_loc_cpu[: common.num_reqs + 1]
+    if flags is None or flags.device.type != "cpu" or offsets.device.type != "cpu":
+        raise RuntimeError("FlashMLA requires CPU is_prefilling and query boundaries from the runner")
+    if flags.numel() < common.num_reqs:
+        raise RuntimeError("FlashMLA is_prefilling does not cover the request batch")
+    boundaries = offsets.clamp_max(common.num_actual_tokens).tolist()
+    stages = flags[: common.num_reqs].tolist()
+    first_prefill = common.num_reqs
+    for index, is_prefill in enumerate(stages):
+        if boundaries[index + 1] == boundaries[index]:
+            continue
+        if is_prefill:
+            first_prefill = min(first_prefill, index)
+        elif first_prefill != common.num_reqs:
+            raise RuntimeError("FlashMLA requires real decode requests before prefill requests; check runner ordering")
+    decode_tokens = boundaries[first_prefill]
+    return first_prefill, common.num_reqs - first_prefill, decode_tokens, common.num_actual_tokens - decode_tokens
+
+
 @dataclass(frozen=True)
 class FlashMLAConfig:
     num_heads: int
