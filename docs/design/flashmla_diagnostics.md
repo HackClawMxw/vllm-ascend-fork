@@ -48,6 +48,11 @@ metadata refresh 发生在图外，所以 replay 时仍应出现本轮 metadata 
 
 ## 两机回报约定
 
+首轮真实算子探针若卡在 metadata，可从仓库根目录运行模块形式的
+`python -m tools.flashmla_probe --execute --metadata-only --heads 12 --batch-size 1 --query-len 1 --kv-len 17 --mask-mode 0`。
+该命令只跑一个最小 metadata 用例，打印 `metadata_call`、`metadata_return`、`metadata_synchronized` 三个带 flush 的阶段标记。使用发布机现有的有界执行/超时方法，并在卡住时抓 Python 全线程堆栈和设备侧事件；若只看到 `metadata_call`，重点区分包调用内阻塞与 Python 主线程等待，若看到 `metadata_return` 而未看到 `metadata_synchronized`，则检查异步设备执行/同步。
+不要用 `python tools/flashmla_probe.py`：仓库的 `tools/bisect` 会遮蔽 Python 标准库 `bisect`。metadata 成功后再去掉 `--metadata-only` 进入主算子与数值比较；此探针没有真实服务路由证据。
+
 发布机在 PR #10 回报：实际 SHA、是否 TRACE、环境/包版本、命令、用例与预期、最后一个成功标记、首次错误和完整 traceback、日志/profiler 路径。先区分包导入、Meta、真实 kernel、eager 模块、图 replay、服务六个层次。首轮无需等待本诊断提交；没有失败也要回报实际命中和数值证据。
 
 主力机不把后续诊断版或修复版自动算作首轮已通过版本；每次需要重测时明确新 SHA 和受影响用例。首轮支持范围及剩余 CPU 同步见[开发记录](flashmla_development_status.md)和[1 号对比](flashmla_plan1_comparison.md)。

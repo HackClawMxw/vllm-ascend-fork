@@ -6,6 +6,8 @@ Uses synthetic cache allocations, never model/service cache. Loading the leaf
 adapter via runpy avoids requiring vLLM engine initialization for package P0/P1.
 No kernel is executed unless --execute is passed. Numerical acceptance requires
 explicit --atol and --rtol; otherwise errors are reported without a pass claim.
+Run as ``python -m tools.flashmla_probe`` from the repo root so ``tools/bisect``
+does not shadow Python's standard ``bisect`` module.
 """
 
 import argparse
@@ -24,6 +26,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--metadata-only", action="store_true", help="Run the real metadata op, then stop before attention"
+    )
     parser.add_argument("--heads", type=int, choices=(8, 12, 64, 96), default=64)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=2)
@@ -36,6 +41,8 @@ def parse_args():
     parser.add_argument("--rtol", type=float)
     parser.add_argument("--output", type=Path, default=Path("flashmla-probe.json"))
     args = parser.parse_args()
+    if args.metadata_only and not args.execute:
+        parser.error("--metadata-only requires --execute")
     if not 0 < args.batch_size < 65536 or not 0 < args.query_len <= args.kv_len:
         parser.error("require 0 < batch-size < 65536 and 0 < query-len <= kv-len")
     if (args.atol is None) != (args.rtol is None):
@@ -152,18 +159,27 @@ def execute_cases(args, adapter, report):
         if args.layout_kv == "PA_BBND"
         else ("contiguous", "page-strided")
     )
+    if args.metadata_only:
+        variants = ("contiguous",)
     for variant in variants:
         result = {"variant": variant, "status": "started"}
         report["cases"].append(result)
         cache, backing = make_cache(cache_cpu, args.layout_kv, variant, args.device)
         result["cache"] = describe(cache)
         before = backing.cpu().clone()
+        print(f"[FlashMLA probe] {variant}: metadata_call", flush=True)
         metadata = adapter.build_metadata(lengths, cu, used)
+        print(f"[FlashMLA probe] {variant}: metadata_return", flush=True)
         torch.npu.synchronize()
+        print(f"[FlashMLA probe] {variant}: metadata_synchronized", flush=True)
         result["metadata"] = describe(metadata)
         meta_capacity = report["metadata_meta"]["shape"]
         if list(metadata.shape) != meta_capacity or metadata.dtype != torch.int32:
             raise ValueError("runtime metadata shape/dtype differs from the package Meta query")
+        if args.metadata_only:
+            result["status"] = "metadata_completed"
+            continue
+        print(f"[FlashMLA probe] {variant}: attention_call", flush=True)
         output, lse = adapter.attention(
             q,
             cache,
@@ -174,7 +190,9 @@ def execute_cases(args, adapter, report):
             metadata=metadata,
             attn_mask=mask,
         )
+        print(f"[FlashMLA probe] {variant}: attention_return", flush=True)
         torch.npu.synchronize()
+        print(f"[FlashMLA probe] {variant}: attention_synchronized", flush=True)
         result["cache_unchanged"] = torch.equal(before, backing.cpu())
         if not result["cache_unchanged"]:
             raise ValueError("attention changed read-only cache or its padding/guards")
@@ -230,7 +248,13 @@ def main():
         if args.execute:
             execute_cases(args, adapter, report)
         report["status"] = "completed"
-        report["validation_scope"] = "operator_probe_only" if args.execute else "schema_and_metadata_meta_only"
+        report["validation_scope"] = (
+            "metadata_kernel_only"
+            if args.metadata_only
+            else "operator_probe_only"
+            if args.execute
+            else "schema_and_metadata_meta_only"
+        )
         report["numerical_acceptance"] = bool(args.execute and args.atol is not None)
     except Exception as exc:
         report["status"] = "failed"
