@@ -33,20 +33,27 @@ def split_flashmla_requests(common) -> tuple[int, int, int, int]:
     offsets = common.query_start_loc_cpu[: common.num_reqs + 1]
     if flags is None or flags.device.type != "cpu" or offsets.device.type != "cpu":
         raise RuntimeError("FlashMLA requires CPU is_prefilling and query boundaries from the runner")
-    if flags.numel() < common.num_reqs:
-        raise RuntimeError("FlashMLA is_prefilling does not cover the request batch")
     boundaries = offsets.clamp_max(common.num_actual_tokens).tolist()
     stages = flags[: common.num_reqs].tolist()
-    first_prefill = common.num_reqs
-    for index, is_prefill in enumerate(stages):
+    if len(stages) < common.num_reqs:
+        if any(boundaries[i + 1] != boundaries[i] for i in range(len(stages), common.num_reqs)):
+            raise RuntimeError("FlashMLA is_prefilling does not cover the active request batch")
+        stages.extend([False] * (common.num_reqs - len(stages)))
+    # FIA may append a dummy request to own graph padding. Exclude trailing
+    # empty rows so they cannot change our captured buffer capacity or route.
+    request_count = common.num_reqs
+    while request_count and boundaries[request_count] == boundaries[request_count - 1]:
+        request_count -= 1
+    first_prefill = request_count
+    for index, is_prefill in enumerate(stages[:request_count]):
         if boundaries[index + 1] == boundaries[index]:
             continue
         if is_prefill:
             first_prefill = min(first_prefill, index)
-        elif first_prefill != common.num_reqs:
+        elif first_prefill != request_count:
             raise RuntimeError("FlashMLA requires real decode requests before prefill requests; check runner ordering")
     decode_tokens = boundaries[first_prefill]
-    return first_prefill, common.num_reqs - first_prefill, decode_tokens, common.num_actual_tokens - decode_tokens
+    return first_prefill, request_count - first_prefill, decode_tokens, common.num_actual_tokens - decode_tokens
 
 
 @dataclass(frozen=True)

@@ -202,3 +202,18 @@ def test_short_prefill_uses_real_phase_and_rejects_interleaved_requests(api):
     common.is_prefilling = torch.tensor([True, False, True])
     with pytest.raises(RuntimeError, match="runner ordering"):
         api.split_flashmla_requests(common)
+
+
+def test_graph_padding_does_not_add_requests_or_require_stage_flags(api):
+    common = SimpleNamespace(
+        num_reqs=3,
+        num_actual_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 8], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False]),
+    )
+    assert api.split_flashmla_requests(common) == (2, 0, 2, 0)
+    common.is_prefilling = torch.tensor([False, True])
+    assert api.split_flashmla_requests(common) == (1, 1, 1, 1)
+    common.num_actual_tokens = 8
+    with pytest.raises(RuntimeError, match="active request batch"):
+        api.split_flashmla_requests(common)
