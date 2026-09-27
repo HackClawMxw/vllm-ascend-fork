@@ -237,11 +237,13 @@ def main():
             name: str(getattr(op, "_schemas", "unavailable"))
             for name, op in (("attention", adapter.attention_op), ("metadata", adapter.metadata_op))
         }
+        print("[FlashMLA probe] meta_call", flush=True)
         meta = adapter.build_metadata(
             torch.empty(args.batch_size, dtype=torch.int32, device="meta"),
             torch.empty(args.batch_size + 1, dtype=torch.int32, device="meta"),
             torch.empty(args.batch_size, dtype=torch.int32, device="meta"),
         )
+        print("[FlashMLA probe] meta_return", flush=True)
         report["metadata_meta"] = describe(meta)
         if meta.ndim != 1 or meta.numel() == 0 or meta.dtype != torch.int32:
             raise ValueError("package Meta did not return a nonempty int32 schedule")
