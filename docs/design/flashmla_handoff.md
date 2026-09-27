@@ -11,11 +11,26 @@
 - 旧基线：`a583897e0c67d9c23288686728124b04b511a462`，目标 `HackClawMxw/vllm-ascend-fork:0913main`。
 - 目标 draft：[PR #6](https://github.com/HackClawMxw/vllm-ascend-fork/pull/6)；个人备份：[PR #10](https://github.com/Henry-Avery/vllm-ascend/pull/10)。两个 PR 共享 head，继续推送同一分支即可更新。
 - 1 号固定参考：`maoxx241/vllm-ascend-rfc16468-private` 的 `de31c53dc5b94ff246b17aa198404a082162c2f9`；需要该私仓读取权限。不能直接替换成当时最新 head。
-- 阅读顺序：[会话结论](flashmla_session_decisions.md) → [总体分析](flashmla_tiling_oldmain.md) → [逐项清单](flashmla_change_matrix.md) → 外部算子文档 → 当地启动测试 skill。
+- 阅读顺序：[会话结论](flashmla_session_decisions.md) → [分步设计 v1](flashmla_implementation_plan.md) → [总体分析](flashmla_tiling_oldmain.md) → [逐项清单](flashmla_change_matrix.md) → 外部算子文档 → 当地启动测试 skill。
 
 当前使用 `kv_transfer_config=None` 的混部场景，不扩大 2 号新布局的 transfer 支持范围。prefill FIA 与 decode FlashMLA 必须消费同一缓存协议，不能靠阶段切换时重新分配/复制持久 cache 来隐藏不兼容。
 
 先读取目标 checkout 的 `AGENTS.md` 和用户提供的 skill，记录 skill 路径/版本。保留目标机器已有工作，使用合适的独立 checkout；本文不要求移动、覆盖或清理已有运行环境。本机分析未套用某台机器的固定目录或服务命令。
+
+在另一台机器的新目录取得本次交付（不覆盖已有 checkout）：
+
+```bash
+git clone --single-branch --branch codex/flashmla-tiling-oldmain-v2 \
+  https://github.com/Henry-Avery/vllm-ascend.git va-flashmla-decode
+cd va-flashmla-decode
+git rev-parse HEAD
+git log -6 --oneline
+git status --short
+```
+
+若已有专用 checkout，先核对 remotes、branch 和未提交内容，再 fetch/fast-forward；不要在运行中的服务目录直接切分支。下载后记录实际 SHA，阅读上述文档即可获得任务上下文，不依赖原机器的聊天或 `.git/research`。1 号参考仍需另行获取固定私仓版本。
+
+分步设计的 01–10 是代码提交粒度；下表 P0–P7 是部署验收里程碑。两者不是两套实现：P1 对应 01，P3 对应 02–06，P4 对应 07，P5 对应 08，P6 对应 09，P7 对应 10。先完成环境与基线检查，再进入对应代码步骤。
 
 ## 阶段与完成条件
 
@@ -53,4 +68,4 @@
 
 ## 可交给另一台机器的任务说明
 
-> 继续 `Henry-Avery/vllm-ascend:codex/flashmla-tiling-oldmain-v2` 上的 FlashMLA tiling 下沉任务。当前先验证 PD 混部：prefill 必须保留 FIA，decode 接指定外部 FlashMLA，mixed batch 按阶段分流并共用 2 号非连续缓存；不要照搬 1 号将整个 forward 切到 FlashMLA，PD 分离暂不推进。先读取 `docs/design/flashmla_handoff.md`、总体分析和逐项清单，再读取我提供的算子文档与本机启动测试 skill。以 `a583897e` 的 2 号缓存协议为基线，参考固定 `de31c53d` 的 1 号 decode/metadata 流程。复用已有 DeviceMetadataExecutor，逐项适配 MLA/MRv2/图/DSpark，不覆盖 allocator，不将两条分支的底座差异当成必需改动。先冻结合约和验证基线，再按阶段实现与测试，必须提供 FIA prefill→共享 cache→FlashMLA decode 的路由和正确性证据；将真实结果、未覆盖项和最小代码增量推到同一分支，更新 PR #6 和个人备份 PR #10。最终再适配 VA 新主线。
+> 继续 `Henry-Avery/vllm-ascend:codex/flashmla-tiling-oldmain-v2` 上的 FlashMLA tiling 下沉任务。当前先验证 PD 混部：prefill 必须保留 FIA，decode 接指定外部 FlashMLA，mixed batch 按阶段分流并共用 2 号非连续缓存；不要照搬 1 号将整个 forward 切到 FlashMLA，PD 分离暂不推进。先读取 `docs/design/flashmla_handoff.md`、`flashmla_session_decisions.md`、`flashmla_implementation_plan.md`、总体分析和逐项清单，再读取我提供的算子文档与本机启动测试 skill。以 `a583897e` 的 2 号缓存协议为基线，参考固定 `de31c53d` 的 1 号 decode/metadata 流程。先核实真实阶段与排序，避免短 prefill 被 decode_threshold 误分流；复用原 prefill writer，不添加 attention 后 cache 重排。复用已有 DeviceMetadataExecutor，逐项适配 MLA/MRv2/图/DSpark，不覆盖 allocator。先冻结合约和验证基线，再按设计 01–10 一点一提交，验证并解释清楚后改下一处。必须提供 FIA prefill→共享 cache→FlashMLA decode 的路由和正确性证据；将真实结果、未覆盖项和最小代码增量推到同一分支，更新 PR #6 和个人备份 PR #10。最终再适配 VA 新主线。

@@ -2,6 +2,8 @@
 
 本文是接入前的源码分析，不是已经实现的改动列表。固定 SHA、调用链和参数待确认项见 [总体分析](flashmla_tiling_oldmain.md)，执行顺序见 [交接流程](flashmla_handoff.md)。
 
+每个 F 项映射到可单独提交的代码步骤，详见[分步设计 v1](flashmla_implementation_plan.md)。特别是阶段分流必须同时核对 `is_prefilling`、请求排序与 splitter，不能只替换 `_forward_decode`。
+
 **当前执行要求：先做 PD 混部，prefill 保留 FIA，decode 接外部 FlashMLA，共用 2 号非连续 cache。PD 分离暂不推进。** 下表描述 1 号更广的实现不代表照搬；此前将 absorbed prefill 接入 FlashMLA 的计划已取消。布局选择还须满足 eligibility，包括无 KV transfer，不能仅按 A5/head 数判断。
 
 ## 比较口径
