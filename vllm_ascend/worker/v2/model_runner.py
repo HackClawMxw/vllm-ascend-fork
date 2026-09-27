@@ -69,9 +69,10 @@ from vllm_ascend.utils import (
     set_potential_max_tokens,
     vllm_version_is,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
-from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.attn_utils import build_attn_state, flashmla_metadata_scope
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -148,6 +149,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.flashmla_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -338,7 +340,7 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        with pcp_dispatch_context():
+        with pcp_dispatch_context(), flashmla_metadata_scope(self.attn_groups, self.flashmla_executor):
             output = super().execute_model(
                 scheduler_output,
                 intermediate_tensors=intermediate_tensors,
@@ -379,6 +381,9 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+        self.cudagraph_manager.flashmla_has_prefill = bool(
+            ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
+        )
         if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
             # The upstream length-based ordering may interleave short prompt
             # suffixes with decode. Reorder every request field together before
