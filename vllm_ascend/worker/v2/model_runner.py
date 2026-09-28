@@ -46,6 +46,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
@@ -68,10 +69,12 @@ from vllm_ascend.utils import (
     set_potential_max_tokens,
     vllm_version_is,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataExecutor
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
-from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.attn_utils import build_attn_state, flashmla_metadata_scope
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
+from vllm_ascend.worker.v2.flashmla_sample_diagnostics import install_sample_diagnostics
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -147,6 +150,9 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.flashmla_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
+        if ascend_envs.VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR:
+            install_sample_diagnostics(self, ascend_envs)
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -337,7 +343,14 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
-        with pcp_dispatch_context():
+        # Initial memory profiling skips attention before KV cache initialization
+        # creates the groups. Other runs still require initialized builders.
+        attn_groups = getattr(self, "attn_groups", None)
+        if attn_groups is None:
+            if not (dummy_run and is_profile and skip_attn_for_dummy_run):
+                raise RuntimeError("MRv2 attention groups are unavailable outside initial memory profiling")
+            attn_groups = ()
+        with pcp_dispatch_context(), flashmla_metadata_scope(attn_groups, self.flashmla_executor):
             output = super().execute_model(
                 scheduler_output,
                 intermediate_tensors=intermediate_tensors,
@@ -378,6 +391,24 @@ class NPUModelRunner(GPUModelRunner):
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+        # Memory profiling runs before initialize_kv_cache creates the manager.
+        if self.cudagraph_manager is not None:
+            self.cudagraph_manager.flashmla_has_prefill = bool(
+                ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None and batch_state.has_prefill
+            )
+        if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA and batch_state is not None:
+            # The upstream length-based ordering may interleave short prompt
+            # suffixes with decode. Reorder every request field together before
+            # positions, slots, tables and sampling indices are constructed.
+            order = np.argsort(batch_state.is_prefilling_np, kind="stable")
+            batch_state = batch_state._replace(
+                req_ids=[batch_state.req_ids[index] for index in order],
+                num_scheduled_tokens=batch_state.num_scheduled_tokens[order],
+                idx_mapping_np=batch_state.idx_mapping_np[order],
+                prefill_len_np=batch_state.prefill_len_np[order],
+                num_computed_prefill_tokens_np=batch_state.num_computed_prefill_tokens_np[order],
+                is_prefilling_np=batch_state.is_prefilling_np[order],
+            )
         num_tokens = None
         if vllm_version_is("0.28.0") and self.pcp_manager is not None and batch_state is not None:
             num_tokens = self.pcp_manager.get_num_tokens_for_dispatch(

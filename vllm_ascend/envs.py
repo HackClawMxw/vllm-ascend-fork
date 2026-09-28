@@ -36,6 +36,36 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Opt in to external FlashMLA for supported dense MLA decode layers.
+    # Prefill retains FIA and the existing BBND cache. Default: 0 (disabled).
+    # Valid values: 0 or 1. Not sensitive. Unsupported configurations fail early.
+    "VLLM_ASCEND_ENABLE_FLASH_MLA": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_MLA"),
+    # Diagnostic logging for FlashMLA metadata and graph submission. Default: 0.
+    # Valid: 0/1. No tensor contents or credentials; emits local device addresses.
+    # Debug only: per-step host logging affects performance; disable for benchmarks.
+    "VLLM_ASCEND_FLASH_MLA_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_FLASH_MLA_TRACE"),
+    # Eager-only numerical sampling diagnostics. Default empty disables all hooks.
+    # Nonempty path enables private per-rank reports; artifacts contain request
+    # IDs/token IDs/logits (sensitive run data), never credentials. Debug copies
+    # synchronize selected workers and must not be used for performance results.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR": lambda: os.getenv("VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR", ""),
+    # Default 64, valid 1..128 real sampling calls per worker. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_STEPS": lambda: int(os.getenv("VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_STEPS", "64")),
+    # Default 2, valid 1..8 full-logits rows saved per call. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_ROWS": lambda: int(os.getenv("VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_ROWS", "2")),
+    # Default -1 selects every DP group; otherwise a configured DP rank. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DP_RANK": lambda: int(
+        os.getenv("VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DP_RANK", "-1")
+    ),
+    # Default 0, valid nonnegative configured TP rank in each selected DP. Not sensitive.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_TP_RANK": lambda: int(
+        os.getenv("VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_TP_RANK", "0")
+    ),
+    # Default "0", comma-separated 1..16 nonnegative vocabulary IDs. Not sensitive.
+    # IDs must be verified with the deployed tokenizer; 0 is not assumed to mean !.
+    "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_TOKEN_IDS": lambda: os.getenv(
+        "VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_TOKEN_IDS", "0"
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

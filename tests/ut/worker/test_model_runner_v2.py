@@ -31,6 +31,8 @@ def _make_runner(need_timing: bool = True):
     runner.execute_model_state = None
     runner.is_last_pp_rank = False
     runner.attn_groups = []
+    runner.cudagraph_manager = None
+    runner.flashmla_executor = None
     runner.adaptive_verification = None
     runner.use_fia = False
     return runner
@@ -67,6 +69,45 @@ def test_execute_model_records_profiling_time():
     if not vllm_version_is("0.29.0"):
         expected_kwargs["valid_dummy_state_slots"] = False
     mock_execute_model.assert_called_once_with(scheduler_output, **expected_kwargs)
+
+
+def test_profile_dummy_run_before_attention_groups_init():
+    runner = _make_runner(need_timing=False)
+    del runner.attn_groups
+    runner.flashmla_executor = object()
+    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
+
+    def profile_forward(scheduler_output, **kwargs):
+        # Exercise the real subclass hook reached by the upstream dummy run.
+        assert runner.gather_batch_req_state(scheduler_output, kwargs["dummy_run"]) == (None, 1)
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", side_effect=profile_forward) as mock_execute_model,
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 1)),
+    ):
+        runner.execute_model(
+            scheduler_output,
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    mock_execute_model.assert_called_once()
+
+    with pytest.raises(RuntimeError, match="attention groups are unavailable"):
+        runner.execute_model(scheduler_output)
+
+
+@pytest.mark.parametrize("flashmla_enabled", [False, True])
+def test_dummy_gather_clears_stale_prefill_flag(flashmla_enabled):
+    runner = _make_runner(need_timing=False)
+    runner.cudagraph_manager = SimpleNamespace(flashmla_has_prefill=True)
+    with (
+        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 1)),
+        patch("vllm_ascend.worker.v2.model_runner.ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA", flashmla_enabled),
+    ):
+        assert runner.gather_batch_req_state(SimpleNamespace(), dummy_run=True) == (None, 1)
+    assert runner.cudagraph_manager.flashmla_has_prefill is False
 
 
 def test_execute_model_disables_profiling_timer_and_clears_stale_time():
