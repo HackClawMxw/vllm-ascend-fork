@@ -74,6 +74,7 @@ from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state, flashmla_metadata_scope
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
+from vllm_ascend.worker.v2.flashmla_sample_diagnostics import install_sample_diagnostics
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -150,6 +151,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.flashmla_executor = DeviceMetadataExecutor() if ascend_envs.VLLM_ASCEND_ENABLE_FLASH_MLA else None
+        if ascend_envs.VLLM_ASCEND_FLASH_MLA_SAMPLE_DIAG_DIR:
+            install_sample_diagnostics(self, ascend_envs)
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
